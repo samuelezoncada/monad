@@ -32,6 +32,12 @@ use Throwable;
 use ErrorException;
 
 // --- SERVICE INTERFACES ---
+//
+// These interfaces document the public surface of each service for IDEs and
+// app-side type hints. Built-ins are MagicObject instances resolved from
+// closures, so they do not declare these interfaces at runtime: $app->db is not
+// an `instanceof DB`. A replacement bound with $app->bind() should provide the
+// same methods; it is a structural contract, not a runtime check.
 
 interface DB {
     public function query(string $sql, array $params = []): PDOStatement;
@@ -109,9 +115,18 @@ interface CSRF {
  * @property-read MagicObject $htmx
  */
 interface Request {
+    /** Raw request body, exactly as it arrived. */
     public function body(): string;
-    public function getQueryVar(string $name): mixed;
-    public function getPostVar(string $name): mixed;
+    /**
+     * Parsed body input: $_POST for form/multipart POSTs, a decoded urlencoded or
+     * JSON body for PUT/PATCH/DELETE and JSON requests. With no key, returns all.
+     */
+    public function input(?string $key = null, mixed $default = null): mixed;
+    /** Decoded JSON body (or one key); null when the body is absent or invalid. */
+    public function json(?string $key = null, mixed $default = null): mixed;
+    public function getQueryVar(string $name, mixed $default = null): mixed;
+    /** Body input under its historic name; equivalent to input($name, $default). */
+    public function getPostVar(string $name, mixed $default = null): mixed;
     public function getHeader(string $name): mixed;
 }
 
@@ -127,7 +142,10 @@ interface Response {
     public function setHeader(string $name, string $value): void;
     public function redirect(string $url, int $code = 302): void;
     public function json(mixed $data, int $code = 200): void;
+    /** Plain text body (Content-Type: text/plain). */
     public function text(string $body, int $code = 200): void;
+    /** Already-safe HTML body, emitted without a wrapper (Content-Type: text/html). */
+    public function html(string $body, int $code = 200): void;
     /** Sends HX-Redirect with an empty 200 body, so HTMX navigates instead of swapping. */
     public function htmxRedirect(string $url): void;
     /** Queues an hx-swap-oob fragment, appended after the main body. */
@@ -420,9 +438,21 @@ class TestSuite {
             $serverKey = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
             $_SERVER[$serverKey] = $value;
         }
+        if (isset($options['contentType'])) {
+            $_SERVER['CONTENT_TYPE'] = $options['contentType'];
+        } elseif (isset($_SERVER['HTTP_CONTENT_TYPE'])) {
+            $_SERVER['CONTENT_TYPE'] = $_SERVER['HTTP_CONTENT_TYPE'];
+        }
 
         unset($this->app->request);
         unset($this->app->response);
+
+        // php://input cannot be written from PHP, so the test seam replaces the
+        // stream reader before the request service is first used.
+        if (array_key_exists('body', $options)) {
+            $rawBody = (string) $options['body'];
+            $this->app->request->body = fn() => $rawBody;
+        }
 
         // Stub header emission only; redirect()/json()/text() still run the real path.
         $headers = [];
@@ -565,6 +595,34 @@ class TestSuite {
  * @method void addCommand(string $name, callable $handler)
  */
 class App extends MagicObject {
+    private static ?App $instance = null;
+
+    /** @internal Registers the instance created by the engine's boot sequence. */
+    public static function attach(self $app): void {
+        self::$instance = $app;
+    }
+
+    /**
+     * The app instance the engine created when it was included.
+     *
+     * `$app = require 'monad.php'` is the whole story when the file is required
+     * directly. It is not when Composer's autoloader includes the file: the return
+     * value is discarded, and a second `require` would redeclare the engine's
+     * classes. Composer users therefore boot through this method instead:
+     *
+     *     require 'vendor/autoload.php';
+     *     $app = Monad\App::boot(dirname(__DIR__));
+     *
+     * Passing a root re-points the app before anything is resolved; passing the
+     * current root is a no-op rather than a reset.
+     */
+    public static function boot(?string $root = null): self {
+        $app = self::$instance
+            ?? throw new \LogicException('Monad: no instance yet. Require monad.php (or let the autoloader load Monad\App) before calling boot().');
+        if ($root !== null && rtrim($root, '/') !== $app->root) $app->setRoot($root);
+        return $app;
+    }
+
     /**
      * Resolves a bound service from the container.
      * 
@@ -587,19 +645,24 @@ class App extends MagicObject {
     }
 
     /**
-     * Points the app at a different project directory. monad.ini, views, the
+     * Points the app at a different project directory. config.php, views, the
      * database, cache and migrations all resolve from here. Call it before
      * booting; already-resolved services are discarded.
      */
     public function setRoot(string $dir): void {
         $this->props['root'] = rtrim($dir, '/');
+        // An entry point outside the app root requires the engine before the app's
+        // Composer dependencies are reachable; load them now that the root is known.
+        // require_once makes this a no-op when the entry point already did it.
+        $autoload = $this->props['root'] . '/vendor/autoload.php';
+        if (is_file($autoload)) require_once $autoload;
         $this->reset();
     }
 
     /**
      * True when the request reached the app over HTTPS.
      *
-     * X-Forwarded-Proto is only honoured when [server] trust_proxy is enabled, so a
+     * X-Forwarded-Proto is only honoured when server.trust_proxy is enabled, so a
      * client talking to the app directly cannot spoof it. Enable trust_proxy only
      * when a reverse proxy terminates TLS and the app is not directly reachable.
      */
@@ -628,10 +691,12 @@ class App extends MagicObject {
 }
 
 /**
- * App root: the directory that owns monad.ini, views, the database, cache and
- * migrations. It defaults to the directory of the real entry script, so
- * requiring this file from ../blog boots with ../blog as the app, not the
- * framework checkout. The `monad` CLI overrides it with the working directory.
+ * App root: the directory that owns config.php, views, the database, cache and
+ * migrations. It defaults to the directory of the real entry script, so a
+ * required engine boots with that script's directory as the app. An entry point
+ * under public/ must therefore call setRoot() (or App::boot()) with the parent,
+ * so paths never resolve inside the docroot. The `monad` CLI overrides it with
+ * the working directory.
  */
 $entryScript = get_included_files()[0] ?? __FILE__;
 $root = dirname(realpath($entryScript) ?: __FILE__);
@@ -812,73 +877,109 @@ EOT;
 
         $method = $this->request->method;
         $path = $this->request->path;
-        $matched = null;
-        foreach ($this->routes[$method] ?? [] as $route) {
-            if (preg_match($route['pattern'], $path, $matches)) {
-                $params = array_filter($matches, 'is_string', ARRAY_FILTER_USE_KEY);
-                $this->request->params = array_map('rawurldecode', $params);
-                $matched = $route;
-                break;
-            }
-        }
-        if (!$matched) {
-            // Distinguish "no such path" from "wrong verb for this path".
-            $allowed = [];
-            foreach ($this->routes as $otherMethod => $routes) {
-                if ($otherMethod === $method) continue;
-                foreach ($routes as $route) {
-                    if (preg_match($route['pattern'], $path)) { $allowed[] = $otherMethod; break; }
-                }
-            }
-            if ($allowed) {
-                $this->response->setHeader('Allow', implode(', ', $allowed));
-                if ($this->wantsJson()) $this->response->json(['error' => 'Method Not Allowed'], 405);
-                else $this->response->text('405 Method Not Allowed', 405);
-                return;
-            }
-            if ($this->wantsJson()) $this->response->json(['error' => 'Not Found'], 404);
-            else $this->response->text('404 Not Found', 404);
-            return;
-        }
-        
-        $resolver = function ($mw) {
-            if (!is_string($mw)) return $mw;
-            // A bound name is required: otherwise PHP would look for a global function.
-            if (!isset($this->registry[$mw])) {
-                throw new \RuntimeException("Middleware '$mw' is not bound. Register it with \$app->bind('$mw', fn(\$app, \$next) => ...).");
-            }
-            $resolved = $this->registry[$mw];
-            // A service factory used as middleware would swallow $next; reject it early.
-            if ($resolved instanceof \Closure) {
-                $ref = new \ReflectionFunction($resolved);
-                if ($ref->getNumberOfParameters() < 2 && !$ref->isVariadic()) {
-                    throw new \RuntimeException("'$mw' is bound as a service, not a middleware: a middleware closure must accept (\$app, \$next).");
-                }
-            }
-            return $resolved;
-        };
+
+        // HEAD is GET without a body: try any explicit HEAD routes, then the GET
+        // table, and discard whatever gets rendered. Status and headers still go out.
+        $head = $method === 'HEAD';
+        $tables = $head ? ['HEAD', 'GET'] : [$method];
+        $obLevel = ob_get_level();
+        if ($head) ob_start();
 
         try {
-            $pipeline = array_map($resolver, array_merge($this->globalMiddleware, $matched['middleware']));
-            $handler = $matched['handler'];
-
-            // Onion pipeline: wrap the handler, then apply middleware in reverse order.
-            $chain = function ($app) use ($handler) {
-                if (is_array($handler)) {
-                    $controller = new $handler[0]();
-                    $method = $handler[1];
-                    return $controller->$method($app);
+            $matched = null;
+            foreach ($tables as $table) {
+                foreach ($this->routes[$table] ?? [] as $route) {
+                    if (preg_match($route['pattern'], $path, $matches)) {
+                        $params = array_filter($matches, 'is_string', ARRAY_FILTER_USE_KEY);
+                        $this->request->params = array_map('rawurldecode', $params);
+                        $matched = $route;
+                        break 2;
+                    }
                 }
-                return $handler($app);
+            }
+            if (!$matched) {
+                // Distinguish "no such path" from "wrong verb for this path".
+                // OPTIONS is answered automatically for any path that has routes.
+                $page = function (string $title): string {
+                    return "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>$title</title></head>"
+                         . "<body style=\"font-family:system-ui,sans-serif;text-align:center;padding:4rem\">"
+                         . "<h1>$title</h1></body></html>";
+                };
+                $allowed = [];
+                foreach ($this->routes as $otherMethod => $routes) {
+                    if (in_array($otherMethod, $tables, true)) continue;
+                    foreach ($routes as $route) {
+                        if (preg_match($route['pattern'], $path)) {
+                            $allowed[$otherMethod] = true;
+                            // A GET route is also a HEAD route.
+                            if ($otherMethod === 'GET') $allowed['HEAD'] = true;
+                            break;
+                        }
+                    }
+                }
+                if ($allowed) {
+                    $allowed['OPTIONS'] = true;
+                    $order = ['GET' => 0, 'HEAD' => 1, 'POST' => 2, 'PUT' => 3, 'PATCH' => 4, 'DELETE' => 5, 'OPTIONS' => 6];
+                    uksort($allowed, fn ($a, $b) => ($order[$a] ?? 99) <=> ($order[$b] ?? 99));
+                    $this->response->setHeader('Allow', implode(', ', array_keys($allowed)));
+
+                    if ($method === 'OPTIONS') {
+                        $this->response->setStatusCode(204);
+                        $this->response->sent = true;
+                        return;
+                    }
+
+                    if ($this->wantsJson()) $this->response->json(['error' => 'Method Not Allowed'], 405);
+                    else $this->response->html($page('405 Method Not Allowed'), 405);
+                    return;
+                }
+                if ($this->wantsJson()) $this->response->json(['error' => 'Not Found'], 404);
+                else $this->response->html($page('404 Not Found'), 404);
+                return;
+            }
+
+            $resolver = function ($mw) {
+                if (!is_string($mw)) return $mw;
+                // A bound name is required: otherwise PHP would look for a global function.
+                if (!isset($this->registry[$mw])) {
+                    throw new \RuntimeException("Middleware '$mw' is not bound. Register it with \$app->bind('$mw', fn(\$app, \$next) => ...).");
+                }
+                $resolved = $this->registry[$mw];
+                // A service factory used as middleware would swallow $next; reject it early.
+                if ($resolved instanceof \Closure) {
+                    $ref = new \ReflectionFunction($resolved);
+                    if ($ref->getNumberOfParameters() < 2 && !$ref->isVariadic()) {
+                        throw new \RuntimeException("'$mw' is bound as a service, not a middleware: a middleware closure must accept (\$app, \$next).");
+                    }
+                }
+                return $resolved;
             };
 
-            foreach (array_reverse($pipeline) as $mw) {
-                $next = $chain;
-                $chain = fn ($app) => $mw($app, $next);
+            try {
+                $pipeline = array_map($resolver, array_merge($this->globalMiddleware, $matched['middleware']));
+                $handler = $matched['handler'];
+
+                // Onion pipeline: wrap the handler, then apply middleware in reverse order.
+                $chain = function ($app) use ($handler) {
+                    if (is_array($handler)) {
+                        $controller = new $handler[0]();
+                        $method = $handler[1];
+                        return $controller->$method($app);
+                    }
+                    return $handler($app);
+                };
+
+                foreach (array_reverse($pipeline) as $mw) {
+                    $next = $chain;
+                    $chain = fn ($app) => $mw($app, $next);
+                }
+                $chain($this);
+            } catch (Throwable $e) {
+                $this->renderError($e);
             }
-            $chain($this);
-        } catch (Throwable $e) {
-            $this->renderError($e);
+        } finally {
+            // Covers handlers that echo directly, not just response->render()/json()/text().
+            if ($head) { while (ob_get_level() > $obLevel) @ob_end_clean(); }
         }
     },
     'renderError' => function ($app, Throwable $e) {
@@ -1053,15 +1154,21 @@ function route_pattern(string $path): string
 }
 
 // --- CORE SERVICES ---
+/**
+ * Configuration comes from <root>/config.php, which must return an array; its
+ * keys become $app->config->key. The file is optional: without it the app runs
+ * on defaults. It is re-executed whenever the container resets (setRoot/reset),
+ * so it must stay pure data — no side effects, no function declarations.
+ */
 $app->bind('config', function($app) {
-    $file = $app->root . '/monad.ini';
-    // INI_SCANNER_TYPED: without it `debug = false` arrived as the string "" and
-    // every numeric setting as a string.
-    $data = file_exists($file) ? (parse_ini_file($file, true, INI_SCANNER_TYPED) ?: []) : [];
+    $file = $app->root . '/config.php';
+    if (!is_file($file)) return new MagicObject(['debug' => true]);
 
-    return new MagicObject($data ?: [
-        'debug' => true, 
-    ]);
+    $data = require $file;
+    if (!is_array($data)) {
+        throw new \RuntimeException("$file must return an array, got " . gettype($data));
+    }
+    return new MagicObject($data);
 });
 
 $app->bind('db', function($app) {
@@ -1196,7 +1303,7 @@ $app->bind('flash', function ($app) {
     $app->session; // force session initialisation
     return new MagicObject([
         'set' => function ($_, string $key, mixed $value): void { $_SESSION['_flash'][$key] = $value; },
-        'has' => fn ($_, string $key): bool => isset($_SESSION['_flash'][$key]),
+        'has' => fn ($_, string $key): bool => array_key_exists($key, $_SESSION['_flash'] ?? []),
         'peek' => fn ($_, string $key, mixed $default = null): mixed => $_SESSION['_flash'][$key] ?? $default,
         'get' => function ($_, string $key, mixed $default = null): mixed {
             $value = $_SESSION['_flash'][$key] ?? $default;
@@ -1213,11 +1320,11 @@ $app->bind('flash', function ($app) {
 
 /**
  * Minimal authentication over the session and PHP's own password hashing.
- * Configure with [auth] table / identifier / password in monad.ini.
+ * Configure with auth.table / auth.id / auth.identifier / auth.password.
  */
 $app->bind('auth', function ($app) {
     $cfg = $app->config->auth ?? [];
-    foreach (['table' => 'users', 'identifier' => 'email', 'password' => 'password'] as $key => $default) {
+    foreach (['id' => 'id', 'table' => 'users', 'identifier' => 'email', 'password' => 'password'] as $key => $default) {
         $value = (string) ($cfg[$key] ?? $default);
         if (!preg_match('/^[a-zA-Z0-9_]+$/', $value)) throw new \InvalidArgumentException("Invalid auth $key: '$value'");
         $cfg[$key] = $value;
@@ -1228,6 +1335,7 @@ $app->bind('auth', function ($app) {
         'table' => $cfg['table'],
         'identifier' => $cfg['identifier'],
         'passwordColumn' => $cfg['password'],
+        'idColumn' => $cfg['id'],
         'hash' => fn ($_, string $password): string => password_hash($password, PASSWORD_DEFAULT),
         'attempt' => function ($auth, string $identifier, string $password): bool {
             $row = $auth->app->db->fetchOne(
@@ -1243,7 +1351,7 @@ $app->bind('auth', function ($app) {
         },
         'login' => function ($auth, array $user): void {
             $auth->app->session->regenerate(true);   // session fixation defence
-            $auth->app->session->set('_auth_id', $user['id'] ?? null);
+            $auth->app->session->set('_auth_id', $user[$auth->idColumn] ?? null);
             unset($user[$auth->passwordColumn]);
             $auth->_user = $user;
         },
@@ -1256,7 +1364,7 @@ $app->bind('auth', function ($app) {
             if (isset($auth->_user)) return $auth->_user;
             $id = $auth->app->session->get('_auth_id');
             if ($id === null) return $auth->_user = null;
-            $row = $auth->app->db->fetchOne("SELECT * FROM {$auth->table} WHERE id = :id", ['id' => $id]);
+            $row = $auth->app->db->fetchOne("SELECT * FROM {$auth->table} WHERE {$auth->idColumn} = :id", ['id' => $id]);
             if ($row !== null) unset($row[$auth->passwordColumn]);   // never hand the hash around
             return $auth->_user = $row;
         },
@@ -1331,7 +1439,9 @@ $app->bind('csrf', function($app) {
  * concurrent reader never sees a half-written entry. TTL 0 means "no expiry".
  */
 $app->bind('cache', function ($app) {
-    $dir = (string) ($app->config->cache['path'] ?? sys_get_temp_dir() . '/monad-cache');
+    // Defaults under the app root, like every other path: the docroot is public/,
+    // so this stays private.
+    $dir = (string) ($app->config->cache['path'] ?? 'cache');
     if (!str_starts_with($dir, '/')) $dir = $app->root . '/' . $dir;
     $dir = rtrim($dir, '/');
     if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
@@ -1403,12 +1513,51 @@ $app->bind('cache', function ($app) {
 
 $app->bind('request', function($app) {
     $getHeader = fn($_, $n) => $_SERVER['HTTP_' . strtoupper(str_replace('-', '_', (string)$n))] ?? null;
+
+    $contentType = function (): string {
+        return strtolower((string) ($_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? ''));
+    };
+    $decodeJson = function ($req): mixed {
+        $raw = (string) $req->body();
+        if ($raw === '') return null;
+        $decoded = json_decode($raw, true);
+        return json_last_error() === JSON_ERROR_NONE ? $decoded : null;
+    };
+    $parseInput = function ($req) use ($contentType, $decodeJson): array {
+        // PHP fills $_POST for POST form/multipart bodies; for other verbs (and
+        // JSON requests) the body has to be parsed from the raw stream.
+        if ($_POST !== []) return $_POST;
+
+        $type = $contentType();
+        if (str_contains($type, 'application/json') || str_contains($type, '+json')) {
+            $decoded = $decodeJson($req);
+            return is_array($decoded) ? $decoded : [];
+        }
+        if (str_contains($type, 'application/x-www-form-urlencoded')) {
+            $raw = (string) $req->body();
+            if ($raw === '') return [];
+            parse_str($raw, $form);
+            return is_array($form) ? $form : [];
+        }
+        return [];
+    };
+
     return new MagicObject([
         'method' => $_SERVER['REQUEST_METHOD'] ?? 'GET',
         'path' => parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/',
         'params' => [],
         'getQueryVar' => fn($_, string $n, mixed $d = null) => $_GET[$n] ?? $d,
-        'getPostVar' => fn ($_, string $n, mixed $d = null) => $_POST[$n] ?? $d,
+        'input' => function ($req, ?string $key = null, mixed $default = null) use ($parseInput) {
+            if (!array_key_exists('_input', $req->props())) $req->_input = $parseInput($req);
+            $input = $req->_input;
+            return $key === null ? $input : ($input[$key] ?? $default);
+        },
+        'json' => function ($req, ?string $key = null, mixed $default = null) use ($decodeJson) {
+            $decoded = $decodeJson($req);
+            if ($key === null) return $decoded;
+            return is_array($decoded) ? ($decoded[$key] ?? $default) : $default;
+        },
+        'getPostVar' => fn($req, string $n, mixed $d = null) => $req->input($n, $d),
         'getHeader' => $getHeader,
         'body' => function () { static $c = null; if ($c === null) $c = file_get_contents('php://input'); return $c; },
         'htmx' => new MagicObject([
@@ -1445,7 +1594,8 @@ $app->bind('response', function($app) {
     };
 
     // Views default to the app root: html.pages.home -> <root>/html/pages/home.php.
-    // Move them outside the docroot with [views] path = "..." if they must not be requestable.
+    // With the docroot at public/ that is already private; override with views.path
+    // if templates live elsewhere.
     $viewRoot = (string) ($app->config->views['path'] ?? $app->root);
     if (!str_starts_with($viewRoot, '/')) $viewRoot = $app->root . '/' . $viewRoot;
     $viewRoot = rtrim($viewRoot, '/');
@@ -1540,17 +1690,28 @@ $app->bind('response', function($app) {
         'text' => function ($res, string $body, int $c = 200) {
             if ($res->sent) return;
             $res->setStatusCode($c);
+            $res->setHeader('Content-Type', 'text/plain; charset=utf-8');
+            echo $body;
+            $res->sent = true;
+        },
+        'html' => function ($res, string $body, int $c = 200) {
+            if ($res->sent) return;
+            $res->setStatusCode($c);
             $res->setHeader('Content-Type', 'text/html; charset=utf-8');
-            echo "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>" . htmlspecialchars($body)
-               . "</title></head><body style=\"font-family:system-ui,sans-serif;text-align:center;padding:4rem\"><h1>"
-               . htmlspecialchars($body) . "</h1></body></html>";
+            echo $body;
             $res->sent = true;
         },
         'partial' => function ($res, string $template, array $data = []) use ($compileViewContext, $resolveTemplate) {
             $view = $compileViewContext($res, $data);
+            $level = ob_get_level();
             ob_start();
-            include $resolveTemplate($template);
-            return ob_get_clean();
+            try {
+                include $resolveTemplate($template);
+                return ob_get_clean();
+            } catch (\Throwable $e) {
+                while (ob_get_level() > $level) @ob_end_clean();
+                throw $e;
+            }
         },
         'render' => function ($res, string $template, array $data = [], int $statusCode = 200) use ($compileViewContext, $resolveTemplate) {
             if ($res->sent) return;
@@ -1567,18 +1728,29 @@ $app->bind('response', function($app) {
                 include $path;
             };
 
+            // Capture the whole response so a template/layout that throws cannot leak
+            // partial markup into the error page.
+            $level = ob_get_level();
             ob_start();
-            $renderFile($resolveTemplate($template), $view);
-            $slot = ob_get_clean();
+            try {
+                ob_start();
+                $renderFile($resolveTemplate($template), $view);
+                $slot = ob_get_clean();
 
-            if ($res->layout && !$res->app->request->htmx->is) {
-                $renderFile($resolveTemplate($res->layout), $view, $slot);
-            } else {
-                echo $slot;
+                if ($res->layout && !$res->app->request->htmx->is) {
+                    $renderFile($resolveTemplate($res->layout), $view, $slot);
+                } else {
+                    echo $slot;
+                }
+                foreach ($res->oobFragments as $fragment) {
+                    echo $res->partial($fragment['template'], $fragment['data']);
+                }
+            } catch (\Throwable $e) {
+                while (ob_get_level() > $level) @ob_end_clean();
+                throw $e;
             }
-            foreach ($res->oobFragments as $fragment) {
-                echo $res->partial($fragment['template'], $fragment['data']);
-            }
+            $body = ob_get_clean();
+            echo $body;
             $res->sent = true;
         }
     ]);
@@ -1620,5 +1792,6 @@ $app->bind('log', function ($app, $next) {
     $app->logger("{$app->response->statusCode} ({$ms}ms)");
 });
 
-// The engine never dispatches: index.php (or the monad CLI) decides when to run.
+// The engine never dispatches: public/index.php (or the monad CLI) decides when to run.
+App::attach($app);
 return $app;

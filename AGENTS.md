@@ -1,13 +1,14 @@
 # AGENTS.md
 
-- Monad is a single-file PHP micro-framework. `monad.php` is the entire engine; `index.php` is the app entry point. No `src/`, no build step, no Composer required.
-- The single-file rule is an architectural constraint: engine logic lives only in `monad.php`. `index.php` (12 lines) and the `monad` CLI (8 lines) are launchers — require, setRoot, dispatch — and must stay trivial. `tests.php` is the suite, not runtime code.
-- `monad.php` returns `$app` when required and never dispatches. `index.php` (or the `monad` CLI) calls `$app->dispatch()`.
-- PHP 8.0+, PDO extension. Dev server: `php -S localhost:8000 -t .`
-- `cp monad.example.ini monad.ini` on first clone — `monad.ini` is gitignored. Config is loaded into `$app->config` only (never exported to the environment).
-- `$app->root` is the app directory; `monad.ini`, views, db, cache and migrations resolve from it. It defaults to the entry script's directory; `$app->setRoot()` overrides it. The `monad` CLI uses the working directory. Global handlers are installed by `dispatch()`, not on include.
-- Built-in services (all opt-in, lazy): `db` (+`transaction`), `session`, `flash`, `csrf` (enforce via `verifyCsrf` middleware), `auth` (+`requireAuth` middleware), `cache`, `migrator`. Read `README.md` for the full API.
+- Monad is a single-file PHP micro-framework. `monad.php` is the entire engine. This repository is the library — engine, CLI, tests, docs; the app and its entry point live in a separate project. No `src/`, no build step, no Composer required.
+- The single-file rule is an architectural constraint: engine logic lives only in `monad.php`. The app's entry point and the `monad` CLI are launchers — require/boot, setRoot, dispatch — and must stay trivial. `tests.php` and `tests/fixture-app/` are tests, not runtime code, and are excluded from the package.
+- `bootstrap.php` in the app root is the app's registration file (routes and commands). The entry point requires it and the CLI auto-loads it before dispatching, so both see the same app surface. `config.php` stays pure data; `bootstrap.php` is executable app code.
+- `monad.php` returns `$app` when required, registers the instance with `App::attach()`, and never dispatches. The app entry point (or the `monad` CLI) calls `$app->dispatch()`. Apps that are autoloaded instead of required boot via `Monad\App::boot($root)`.
+- PHP 8.0+, PDO extension. In an app the docroot is `public/` (dev server: `php -S localhost:8000 -t public`); config, templates, db, cache and migrations live above it and must stay unreachable over HTTP. This repository has no app entry of its own.
+- Config lives in `<root>/config.php`, which returns an array and is optional. It is re-executed on `reset()`/`setRoot()`, so it must stay pure data. Config is loaded into `$app->config` only (never exported to the environment). There is no `.ini` file.
+- `$app->root` is the app directory; `config.php`, views, db, cache and migrations resolve from it. It defaults to the entry script's directory, which is `public/` in the recommended layout, so the entry point must call `$app->setRoot(dirname(__DIR__))` (or `App::boot($root)`). The `monad` CLI uses the working directory. Global handlers are installed by `dispatch()`, not on include.
+- Built-in services (all opt-in, lazy): `db` (+`transaction`), `session`, `flash`, `csrf` (enforce via `verifyCsrf` middleware), `auth` (+`requireAuth` middleware), `cache`, `migrator`, `logger` (+`log` middleware). Read `README.md` for the full API. Request bodies are available through `$app->request->input()` / `->json()` for form, URL-encoded and JSON payloads; `getPostVar()` is an alias.
 - Tests run via `./monad test` (not PHPUnit). Container resets between cases. Set `$app->config->db = ['path' => ':memory:']` in `beforeEach` for DB tests.
 - `MagicObject` caches factory results as singletons. Use `$app->reset()` to force re-resolution.
 - Templates use dot-notation: `html.foo.bar` → `./html/foo/bar.php`. Layout is skipped during HTMX requests.
-- Autoloader: `Monad\Foo\Bar` → `./Monad/Foo/Bar.php`. Composer autoloader auto-detected if present.
+- Autoloader: `Monad\Foo\Bar` → `./Monad/Foo/Bar.php`. Composer autoloader auto-detected if present; `composer.json` maps `monad.php` by classmap, so `Monad\App` autoloads without `require`.

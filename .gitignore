@@ -1,5 +1,5 @@
-monad.ini
 vendor/
+cache/
 *.sqlite
 *.sqlite3
 *.db

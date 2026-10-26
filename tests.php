@@ -27,7 +27,7 @@
  *     ->toContain(mixed $needle)                  String or array contains the value.
  *     ->toBeInstanceOf(string $class)             Value is an instance of the given class.
  *   $test->assertThrows(callable $fn, $class)     Assert that an exception is thrown.
- *   $test->request(string $method, string $uri)   Simulate an in-process HTTP request.
+ *   $test->request(string $method, string $uri, array $opts = [])  Simulate an in-process HTTP request.
  *
  * Lifecycle hooks accumulate: registering a second beforeEach adds to the first
  * rather than replacing it.
@@ -36,6 +36,7 @@
  * ensuring full isolation between test cases.
  */
 
+use Monad\App;
 use Monad\MagicObject;
 use Monad\MagicValue;
 use Monad\RawHtml;
@@ -170,18 +171,13 @@ $test->it("App: root anchors config, views, db, cache and migrations", function(
 
     mkdir($dir . '/tpl', 0775, true);
     mkdir($dir . '/data', 0775, true);
-    file_put_contents($dir . '/monad.ini', <<<'INI'
-        [app]
-        name = "blog"
-        [views]
-        path = "tpl"
-        [db]
-        path = "data/app.sqlite"
-        [cache]
-        path = "var/cache"
-        [migrations]
-        path = "db/migrations"
-        INI);
+    file_put_contents($dir . '/config.php', '<?php return ' . var_export([
+        'app' => ['name' => 'blog'],
+        'views' => ['path' => 'tpl'],
+        'db' => ['path' => 'data/app.sqlite'],
+        'cache' => ['path' => 'var/cache'],
+        'migrations' => ['path' => 'db/migrations'],
+    ], true) . ';');
     file_put_contents($dir . '/tpl/hello.php', 'Hello <?= $view->data->name ?>');
 
     try {
@@ -221,6 +217,115 @@ $test->it("App: a required engine roots at the entry script", function($app, $te
         $test->expect(trim((string) $out))->toEqual(realpath($dir) . '|false');
     } finally {
         @unlink($dir . '/app.php');
+        @rmdir($dir);
+    }
+});
+
+// --- 1c. CONFIG & BOOT ---
+$test->it("Config: config.php is optional, and debug defaults on", function($app, $test) {
+    $old = $app->root;
+    $dir = sys_get_temp_dir() . '/monad-config-' . bin2hex(random_bytes(4));
+    mkdir($dir, 0775, true);
+    try {
+        $app->setRoot($dir);
+        $test->expect($app->config->debug)->toBeTrue();
+    } finally {
+        $app->setRoot($old);
+        @rmdir($dir);
+    }
+});
+
+$test->it("Config: reloads after a reset instead of returning true", function($app, $test) {
+    // require_once would hand `true` back on the second resolution and the
+    // container would fail to build; the file has to be plain `require`.
+    $old = $app->root;
+    $dir = sys_get_temp_dir() . '/monad-config-' . bin2hex(random_bytes(4));
+    mkdir($dir, 0775, true);
+    file_put_contents($dir . '/config.php', '<?php return ["flag" => "on"];');
+    try {
+        $app->setRoot($dir);
+        $test->expect($app->config->flag)->toEqual('on');
+        $app->reset();
+        $test->expect($app->config->flag)->toEqual('on');
+    } finally {
+        $app->setRoot($old);
+        @unlink($dir . '/config.php');
+        @rmdir($dir);
+    }
+});
+
+$test->it("Config: a config.php that does not return an array is rejected", function($app, $test) {
+    $old = $app->root;
+    $dir = sys_get_temp_dir() . '/monad-config-' . bin2hex(random_bytes(4));
+    mkdir($dir, 0775, true);
+    file_put_contents($dir . '/config.php', '<?php return "nope";');
+    try {
+        $test->assertThrows(function () use ($app, $dir) {
+            $app->setRoot($dir);
+            $app->config;
+        }, \RuntimeException::class);
+    } finally {
+        $app->setRoot($old);
+        @unlink($dir . '/config.php');
+        @rmdir($dir);
+    }
+});
+
+$test->it("Cache: defaults to <root>/cache", function($app, $test) {
+    $old = $app->root;
+    $dir = sys_get_temp_dir() . '/monad-cache-' . bin2hex(random_bytes(4));
+    mkdir($dir, 0775, true);
+    try {
+        $app->setRoot($dir);
+        $test->expect($app->cache->dir)->toEqual($dir . '/cache');
+        $test->expect(is_dir($dir . '/cache'))->toBeTrue();
+    } finally {
+        $app->setRoot($old);
+        @rmdir($dir . '/cache');
+        @rmdir($dir);
+    }
+});
+
+$test->it("Boot: App::boot() hands back the booted instance", function($app, $test) {
+    $test->expect(App::boot() === $app)->toBeTrue();
+    $test->expect(App::boot())->toBeInstanceOf(App::class);
+});
+
+$test->it("Boot: re-rooting through App::boot() follows the same rules as setRoot()", function($app, $test) {
+    $app->bind('stamp', fn() => new \stdClass());
+    $first = $app->stamp;
+
+    $test->expect(App::boot($app->root) === $app)->toBeTrue();
+    $test->expect($app->stamp === $first)->toBeTrue();   // same root: nothing is discarded
+
+    $old = $app->root;
+    $dir = sys_get_temp_dir() . '/monad-boot-' . bin2hex(random_bytes(4));
+    mkdir($dir, 0775, true);
+    try {
+        App::boot($dir);
+        $test->expect($app->root)->toEqual($dir);
+        $test->expect($app->stamp === $first)->toBeFalse();   // new root: services re-resolve
+    } finally {
+        App::boot($old);
+        @rmdir($dir);
+    }
+});
+
+$test->it("Boot: setRoot() loads the app's Composer autoloader once the root is known", function($app, $test) {
+    // A sibling-checkout entry point requires the engine before the app's vendor/
+    // is reachable, so the engine has to look again after the root is set.
+    $old = $app->root;
+    $dir = sys_get_temp_dir() . '/monad-autoload-' . bin2hex(random_bytes(4));
+    $class = 'MonadProbe' . bin2hex(random_bytes(4));
+    mkdir($dir . '/vendor', 0775, true);
+    file_put_contents($dir . '/vendor/autoload.php', '<?php class ' . $class . ' {}');
+    try {
+        $app->setRoot($dir);
+        $test->expect(class_exists($class, false))->toBeTrue();
+    } finally {
+        $app->setRoot($old);
+        @unlink($dir . '/vendor/autoload.php');
+        @rmdir($dir . '/vendor');
         @rmdir($dir);
     }
 });
@@ -335,6 +440,26 @@ $test->it("CSRF: verifyCsrf middleware accepts the HTMX header", function($app, 
     $test->expect($res->statusCode)->toEqual(200);
 });
 
+$test->it("CSRF: verifyCsrf middleware accepts a form field on PUT", function($app, $test) {
+    $token = $app->csrf->token();
+    $app->addRoute('PUT', '/save-put', fn($app) => $app->response->text('saved'), ['verifyCsrf']);
+    $res = $test->request('PUT', '/save-put', [
+        'contentType' => 'application/x-www-form-urlencoded',
+        'body' => '_csrf=' . urlencode($token),
+    ]);
+    $test->expect($res->statusCode)->toEqual(200);
+});
+
+$test->it("CSRF: verifyCsrf middleware accepts a field in a JSON body", function($app, $test) {
+    $token = $app->csrf->token();
+    $app->addRoute('DELETE', '/save-json', fn($app) => $app->response->text('saved'), ['verifyCsrf']);
+    $res = $test->request('DELETE', '/save-json', [
+        'contentType' => 'application/json',
+        'body' => json_encode(['_csrf' => $token]),
+    ]);
+    $test->expect($res->statusCode)->toEqual(200);
+});
+
 // --- 4. ROUTER ---
 $test->it("Router: registers simple route", function($app, $test) {
     $app->addRoute('GET', '/unit-test', 'handler');
@@ -410,6 +535,7 @@ $test->it("Router: URL parameters are percent-decoded", function($app, $test) {
 $test->it("Router: an unknown path returns a 404 with a body", function($app, $test) {
     $res = $test->request('GET', '/no/such/path');
     $test->expect($res->statusCode)->toEqual(404);
+    $test->expect($res->getHeader('Content-Type'))->toEqual('text/html; charset=utf-8');
     $test->expect($res->body)->toContain('404');
 });
 
@@ -425,7 +551,53 @@ $test->it("Router: a known path with the wrong verb returns 405 and Allow", func
     $app->addRoute('POST', '/only-post', fn($app) => $app->response->text('ok'));
     $res = $test->request('GET', '/only-post');
     $test->expect($res->statusCode)->toEqual(405);
-    $test->expect($res->getHeader('Allow'))->toEqual('POST');
+    $test->expect($res->getHeader('Allow'))->toEqual('POST, OPTIONS');
+});
+
+$test->it("Router: Allow includes HEAD for a GET route", function($app, $test) {
+    $app->addRoute('GET', '/only-get', fn($app) => $app->response->text('ok'));
+    $res = $test->request('POST', '/only-get');
+    $test->expect($res->statusCode)->toEqual(405);
+    $test->expect($res->getHeader('Allow'))->toEqual('GET, HEAD, OPTIONS');
+});
+
+$test->it("Router: OPTIONS reports the allowed methods with an empty 204", function($app, $test) {
+    $app->addRoute('GET', '/options', fn($app) => $app->response->text('ok'));
+    $app->addRoute('POST', '/options', fn($app) => $app->response->text('ok'));
+    $res = $test->request('OPTIONS', '/options');
+    $test->expect($res->statusCode)->toEqual(204);
+    $test->expect($res->getHeader('Allow'))->toEqual('GET, HEAD, POST, OPTIONS');
+    $test->expect($res->body)->toEqual('');
+});
+
+$test->it("Router: HEAD matches GET routes and sends no body", function($app, $test) {
+    $app->addRoute('GET', '/ping', fn($app) => $app->response->text('pong'));
+    $res = $test->request('HEAD', '/ping');
+    $test->expect($res->statusCode)->toEqual(200);
+    $test->expect($res->body)->toEqual('');
+});
+
+$test->it("Router: HEAD discards direct output, not just response helpers", function($app, $test) {
+    $app->addRoute('GET', '/echo', function($app) { echo 'raw output'; });
+    $res = $test->request('HEAD', '/echo');
+    $test->expect($res->statusCode)->toEqual(200);
+    $test->expect($res->body)->toEqual('');
+});
+
+$test->it("Router: an explicit HEAD route wins over GET", function($app, $test) {
+    $app->addRoute('GET', '/probe', fn($app) => $app->response->text('get'));
+    $app->addRoute('HEAD', '/probe', fn($app) => $app->response->setHeader('X-Source', 'head'));
+    $res = $test->request('HEAD', '/probe');
+    $test->expect($res->getHeader('X-Source'))->toEqual('head');
+    $test->expect($res->body)->toEqual('');
+});
+
+$test->it("Router: HEAD on a path with no GET route still returns 405 and Allow", function($app, $test) {
+    $app->addRoute('POST', '/headless', fn($app) => $app->response->text('ok'));
+    $res = $test->request('HEAD', '/headless');
+    $test->expect($res->statusCode)->toEqual(405);
+    $test->expect($res->getHeader('Allow'))->toEqual('POST, OPTIONS');
+    $test->expect($res->body)->toEqual('');
 });
 
 // --- 5. DATABASE ---
@@ -683,6 +855,19 @@ $test->it("View: a missing template reports itself clearly", function($app, $tes
     });
 });
 
+$test->it("View: a throwing template does not leak buffered output", function($app, $test) use ($useTemplates) {
+    $app->config->debug = false;
+    $useTemplates($app, ['boom' => 'PARTIAL<?php throw new \RuntimeException("boom"); ?>'], function () use ($app, $test) {
+        $app->addRoute('GET', '/throwing-tpl', fn($app) => $app->response->render('boom'));
+        $level = ob_get_level();
+        $res = $test->request('GET', '/throwing-tpl');
+        $test->expect($res->statusCode)->toEqual(500);
+        $test->expect(str_contains($res->body, 'PARTIAL'))->toBeFalse();
+        $test->expect($res->body)->toContain('Something went wrong');
+        $test->expect(ob_get_level())->toEqual($level);
+    });
+});
+
 $test->it("View: shared globals are reachable and escaped in templates", function($app, $test) use ($useTemplates) {
     $useTemplates($app, ['page' => '<p><?= $view->greeting ?></p><p><?= $view->data->x ?></p>'], function () use ($app, $test) {
         $app->share('greeting', fn($app) => '<b>ciao</b>');
@@ -776,6 +961,18 @@ $test->it("Response: json() sets Content-Type header", function($app, $test) {
     $test->expect($res->body)->toEqual('{"status":"ok"}');
 });
 
+$test->it("Response: text() is plain text and html() is emitted verbatim", function($app, $test) {
+    $app->addRoute('GET', '/plain', fn($app) => $app->response->text('<b>not html</b>'));
+    $plain = $test->request('GET', '/plain');
+    $test->expect($plain->getHeader('Content-Type'))->toEqual('text/plain; charset=utf-8');
+    $test->expect($plain->body)->toEqual('<b>not html</b>');
+
+    $app->addRoute('GET', '/markup', fn($app) => $app->response->html('<h1>hi</h1>'));
+    $markup = $test->request('GET', '/markup');
+    $test->expect($markup->getHeader('Content-Type'))->toEqual('text/html; charset=utf-8');
+    $test->expect($markup->body)->toEqual('<h1>hi</h1>');
+});
+
 $test->it("Response: layout skipped during HTMX requests", function($app, $test) use ($useTemplates) {
     $useTemplates($app, ['layout_htmx' => '<wrap><?= $slot ?></wrap>', 'fragment' => 'partial'], function () use ($app, $test) {
         $app->addRoute('GET', '/htmx-fragment', function($app) {
@@ -855,6 +1052,19 @@ $test->it("Auth: logout() clears the identity", function($app, $test) use ($make
     $test->expect($app->auth->user())->toEqual(null);
 });
 
+$test->it("Auth: honours a custom id column", function($app, $test) {
+    $app->config->auth = ['id' => 'user_id', 'table' => 'members'];
+    $app->db->execute('CREATE TABLE members (user_id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT)');
+    $app->db->insert('members', [
+        'email' => 'ada@example.com',
+        'password' => $app->auth->hash('secret123'),
+    ]);
+
+    $test->expect($app->auth->attempt('ada@example.com', 'secret123'))->toBeTrue();
+    $test->expect($app->auth->id())->toEqual(1);
+    $test->expect($app->auth->user()['user_id'])->toEqual(1);
+});
+
 $test->it("Auth: an invalid table name is rejected at configuration time", function($app, $test) {
     $app->config->auth = ['table' => 'users; DROP TABLE users'];
     $test->assertThrows(fn() => $app->auth, \InvalidArgumentException::class);
@@ -908,6 +1118,13 @@ $test->it("Flash: all() drains everything", function($app, $test) {
     $app->flash->set('b', 2);
     $test->expect($app->flash->all())->toEqual(['a' => 1, 'b' => 2]);
     $test->expect($app->flash->all())->toEqual([]);
+});
+
+$test->it("Flash: a stored null still counts as present", function($app, $test) {
+    $app->flash->set('nullish', null);
+    $test->expect($app->flash->has('nullish'))->toBeTrue();
+    $test->expect($app->flash->get('nullish'))->toEqual(null);
+    $test->expect($app->flash->has('nullish'))->toBeFalse();
 });
 
 // --- 11. CACHE ---
@@ -1014,6 +1231,55 @@ $test->it("Request: getPostVar retrieves POST body parameters", function($app, $
         $test->expect($app->request->getPostVar('name'))->toEqual('Mario');
     });
     $test->request('POST', '/submit', ['post' => ['name' => 'Mario']]);
+});
+
+$test->it("Request: parses urlencoded PUT bodies", function($app, $test) {
+    $app->addRoute('PUT', '/update', function($app) use ($test) {
+        $test->expect($app->request->input())->toEqual(['name' => 'Mario']);
+        $test->expect($app->request->input('name'))->toEqual('Mario');
+        $test->expect($app->request->getPostVar('name'))->toEqual('Mario');
+        $app->response->text('ok');
+    });
+    $res = $test->request('PUT', '/update', [
+        'contentType' => 'application/x-www-form-urlencoded',
+        'body' => 'name=Mario',
+    ]);
+    $test->expect($res->statusCode)->toEqual(200);
+});
+
+$test->it("Request: parses JSON bodies", function($app, $test) {
+    $app->addRoute('PATCH', '/person', function($app) use ($test) {
+        $test->expect($app->request->body())->toEqual('{"name":"Mario","tags":["a","b"]}');
+        $test->expect($app->request->input('name'))->toEqual('Mario');
+        $test->expect($app->request->getPostVar('name'))->toEqual('Mario');
+        $test->expect($app->request->json('tags'))->toEqual(['a', 'b']);
+        $test->expect($app->request->json('missing', 'fallback'))->toEqual('fallback');
+        $app->response->text('ok');
+    });
+    $res = $test->request('PATCH', '/person', [
+        'contentType' => 'application/json; charset=utf-8',
+        'body' => '{"name":"Mario","tags":["a","b"]}',
+    ]);
+    $test->expect($res->statusCode)->toEqual(200);
+});
+
+$test->it("Request: supports +json media types and rejects malformed JSON", function($app, $test) {
+    $app->addRoute('POST', '/vendor-json', function($app) use ($test) {
+        $test->expect($app->request->input('name'))->toEqual('Mario');
+    });
+    $test->request('POST', '/vendor-json', [
+        'contentType' => 'application/vnd.api+json',
+        'body' => '{"name":"Mario"}',
+    ]);
+
+    $app->addRoute('POST', '/broken-json', function($app) use ($test) {
+        $test->expect($app->request->json())->toEqual(null);
+        $test->expect($app->request->input())->toEqual([]);
+    });
+    $test->request('POST', '/broken-json', [
+        'contentType' => 'application/json',
+        'body' => '{"name":',
+    ]);
 });
 
 // --- 14. ERROR HANDLING ---

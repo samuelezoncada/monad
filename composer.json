@@ -1,15 +1,42 @@
 {
-  "name": "samuelezoncada/monad",
-  "description": "A single-file PHP micro-framework.",
-  "type": "project",
-  "license": "MIT",
-  "require": {
-    "php": ">=8.0",
-    "ext-pdo": "*"
-  },
-  "scripts": {
-    "post-create-project-cmd": [
-      "cp -n monad.example.ini monad.ini"
-    ]
-  }
+    "name": "samuelezoncada/monad",
+    "description": "A single-file PHP micro-framework.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "micro-framework",
+        "php",
+        "htmx",
+        "ssr",
+        "single-file",
+        "zero-dependencies"
+    ],
+    "authors": [
+        {
+            "name": "Samuele Zoncada"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/samuelezoncada/monad/issues",
+        "source": "https://github.com/samuelezoncada/monad"
+    },
+    "require": {
+        "php": ">=8.0",
+        "ext-pdo": "*",
+        "ext-pdo_sqlite": "*"
+    },
+    "suggest": {
+        "ext-session": "Sessions, flash messages, CSRF and authentication store their state in $_SESSION."
+    },
+    "autoload": {
+        "classmap": [
+            "monad.php"
+        ]
+    },
+    "bin": [
+        "monad"
+    ],
+    "scripts": {
+        "test": "@php monad test"
+    }
 }

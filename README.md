@@ -5,7 +5,7 @@ Monad is an experimental, ultra-lightweight PHP micro-framework whose entire eng
 Despite the tiny core, it ships a surprisingly complete feature set out of the box: DI container, router with onion middleware, auto-escaping view engine, PDO wrapper, sessions, flash messages, CSRF, authentication, filesystem cache, schema migrations and a built-in test runner.
 
 ## Philosophy
-*   **Monofile Core**: the entire engine resides in `monad.php`; your app is a small `index.php` next to it.
+*   **Monofile Core**: the entire engine resides in `monad.php`; your app is a small `public/index.php` with everything private above it.
 *   **Zero Dependencies**: works standalone; Composer's `vendor/autoload.php` is used if present.
 *   **HTMX First**: layouts are skipped on HTMX requests and `HX-*` headers are managed for you.
 *   **Onion Middleware**: process requests on the way in and on the way out.
@@ -23,19 +23,65 @@ Monad is an experimental framework. It is perfect for:
 
 It is **NOT** recommended for massive enterprise monoliths where strict static typing across thousands of files is necessary, as its reliance on `MagicObject` trades static analysis for extreme dynamic flexibility.
 
+Monad is pre-1.0: minor releases may contain breaking changes, and the API is not frozen until 1.0.
+
 ---
 
 ## Quickstart
-Monad requires **PHP 8.0+** and **PDO extension**.
 
-1.  Clone the repository (or copy `monad.php` and `index.php` into your project).
-2.  Start the PHP development server:
-    ```bash
-    php -S localhost:8000 -t .
-    ```
-3.  Optional: configure your database, auth, cache and migrations in the `monad.ini` file.
+Monad requires **PHP 8.0+** (8.0 through 8.5 are tested in CI) with `pdo_sqlite`; sessions, flash messages, CSRF and authentication additionally need `ext-session`. The repository is the library: `monad.php`, the `monad` CLI, the test suite and the docs. Your app lives outside it.
 
-`monad.php` is the engine and is never edited. `index.php` is your entry point: it requires the engine, registers your routes and calls `$app->dispatch()`.
+```bash
+composer require samuelezoncada/monad
+```
+
+Without Composer, copy `monad.php` (and optionally the `monad` CLI) into the app root and swap the `vendor/autoload.php` require below for `require dirname(__DIR__) . '/monad.php'`.
+
+Give the app a `public/` docroot, with everything private above it:
+
+```
+blog/
+├── public/
+│   └── index.php     # entry point; the only reachable file
+├── bootstrap.php     # routes and commands shared by HTTP and CLI
+├── config.php        # optional settings
+├── html/             # templates: html.home -> html/home.php
+├── migrations/
+├── cache/            # created on demand
+├── db.sqlite         # created on demand
+└── vendor/           # Composer dependencies (or monad.php if copied in)
+```
+
+`public/index.php` does three things: require, boot at the app root, dispatch.
+
+```php
+<?php
+require dirname(__DIR__) . '/vendor/autoload.php';
+
+$app = Monad\App::boot(dirname(__DIR__));            // the app root, not the docroot
+require dirname(__DIR__) . '/bootstrap.php';
+
+$app->dispatch();
+```
+
+`bootstrap.php` holds the app's routes and commands, so both `public/index.php` and the `monad` CLI see them:
+
+```php
+<?php
+$app->addRoute('GET', '/', fn ($app) => $app->response->text('It works.'));
+```
+
+Then `php -S localhost:8000 -t public` and open http://localhost:8000.
+
+`Monad\App::boot()` returns the instance the engine created and points it at the given root. The plain-require style works too and skips the class:
+
+```php
+$app = require dirname(__DIR__) . '/monad.php';   // engine copied into the project
+$app->setRoot(dirname(__DIR__));
+require dirname(__DIR__) . '/bootstrap.php';
+```
+
+Keeping `config.php`, templates and the database above `public/` is what makes them unreachable over HTTP. `monad.php` is the engine and is never edited.
 
 All framework classes live in the `Monad` namespace (declared at the top of `monad.php`), so app code typically starts with:
 
@@ -63,7 +109,7 @@ $app->bind(MyService::class, fn($app) => new MyService());
 $app->get(MyService::class)->sayHello();
 ```
 
-Services are singletons; `$app->reset()` clears resolved instances. Override an internal service by rebinding the same name — the replacement must implement the matching `Monad\*` interface (e.g. `Monad\DB`).
+Services are singletons; `$app->reset()` clears resolved instances. Override an internal service by rebinding the same name — the replacement should provide the methods documented by the matching `Monad\*` interface (e.g. `Monad\DB`). Built-ins are `MagicObject` instances, so those interfaces are structural documentation rather than runtime `instanceof` checks.
 
 ### Shared view globals
 `$app->share('stats', fn($app) => new StatsService())` exposes `$view->stats` to every template, resolved lazily. `auth`, `flash` and `csrf` are already shared.
@@ -101,6 +147,47 @@ Routing behaviors:
 * **404 responses have a body** (JSON or HTML depending on the `Accept` header).
 * A known path with the wrong verb returns **405 with an `Allow` header**.
 * Middleware can be bound by name with `$app->bind()` and referenced as a string. An unbound name throws a clear error. A service closure used as middleware (one that only accepts `$app`) is rejected at dispatch time instead of silently aborting the chain.
+* `OPTIONS` is answered automatically with `204` and an `Allow` header for any path that has routes. A `405` also lists `HEAD` (for `GET` routes) and `OPTIONS`.
+
+---
+
+## Requests and Responses
+
+The request object exposes the current request without hiding PHP's superglobals:
+
+```php
+$app->request->method;                 // GET, POST, ...
+$app->request->path;                   // /users/42
+$app->request->params['id'];           // route parameters
+$app->request->getQueryVar('page');    // $_GET, with an optional default
+$app->request->getHeader('HX-Request');
+$app->request->body();                 // raw request body
+```
+
+Body input is parsed from the request body, not just `$_POST`:
+
+```php
+$app->request->input();                    // all body input as an array
+$app->request->input('email');             // one value, or null
+$app->request->input('page', 1);           // with a default
+$app->request->getPostVar('email');        // historic alias of input('email')
+$app->request->json();                     // decoded JSON body, or null
+$app->request->json('items');              // one key from the JSON body
+```
+
+This works for normal POST forms (including multipart), URL-encoded `PUT`/`PATCH`/`DELETE` bodies, and `application/json` or `application/*+json` requests. PHP only parses multipart bodies for POST, so non-POST uploads should use a URL-encoded or JSON body. `$app->request->htmx` exposes `is`, `target`, `trigger`, `triggerName`, `boosted` and `currentUrl`.
+
+Response helpers emit the body and mark the response as sent:
+
+```php
+$app->response->text('plain text');                  // text/plain
+$app->response->html('<h1>ready</h1>');              // text/html, emitted verbatim
+$app->response->json(['ok' => true]);
+$app->response->redirect('/login');
+$app->response->render('html.home', ['title' => 'Home']);
+```
+
+`statusCode`, `headers`, `setStatusCode()` and `setHeader()` are available when a helper is not enough. A second response call after the body is sent is ignored, so a missing `return` cannot corrupt the response.
 
 ---
 
@@ -176,6 +263,8 @@ $app->response->htmx->trigger = 'updateList';
 $app->response->render('user_list', [...]);
 ```
 
+These headers are emitted by `render()` only. Setting one and then calling `json()`, `text()`, `html()` or `redirect()` drops it; use `htmxRedirect()` when the client should navigate.
+
 ### HTMX-specific response helpers
 ```php
 // Navigate the browser instead of swapping a fragment (e.g. after login/logout)
@@ -195,9 +284,29 @@ $app->response->stream(function($emit, $app) {
 
 ---
 
+## Logging
+
+`$app->logger($message)` writes to PHP's `error_log` with the request method and path as a prefix. The `log` middleware logs the status code and duration for every request:
+
+```php
+$app->use('log');
+```
+
+Replace the sink by rebinding `logger`; the closure receives the app and the message:
+
+```php
+$app->bind('logger', function ($app, string $message) {
+    file_put_contents($app->root . '/app.log', $message . "\n", FILE_APPEND);
+});
+```
+
+`$app->wantsJson()` is the shared `Accept: application/json` check used by the built-in error, 404, 405 and auth responses.
+
+---
+
 ## Database
 
-Monad uses SQLite by default (configurable in `monad.ini`).
+Monad uses SQLite by default (configurable in `config.php`).
 The DB service includes quick methods to avoid writing tedious SQL boilerplate:
 
 ```php
@@ -230,13 +339,17 @@ Table and column names are validated against `/^[a-zA-Z0-9_]+$/` — invalid nam
 
 The `auth` service is session-based and reads a user table you define. It is fully opt-in: nothing touches the database until you call it, and no table is auto-created.
 
-### Configuration (`monad.ini`)
-```ini
-[auth]
-table = "users"
-identifier = "email"
-password = "password"
-loginPath = "/login"
+### Configuration (`config.php`)
+```php
+return [
+    'auth' => [
+        'table' => 'users',
+        'id' => 'id',               // primary key column
+        'identifier' => 'email',
+        'password' => 'password',
+        'loginPath' => '/login',
+    ],
+];
 ```
 
 ### Service API
@@ -274,7 +387,7 @@ When unauthenticated it: redirects to `loginPath` (302) for browser requests, an
 
 ### Notes
 * The login form and `/login` route are up to your app.
-* Login state is just the user id stored in the session (`_auth_id`); `login()` regenerates the session id to prevent fixation.
+* Login state is just the value of `auth.id` stored in the session (`_auth_id`); `login()` regenerates the session id to prevent fixation.
 * The password hash is never exposed through `user()`.
 
 ---
@@ -284,7 +397,7 @@ When unauthenticated it: redirects to `loginPath` (302) for browser requests, an
 ### Sessions
 Cookies are hardened by default: `HttpOnly`, `SameSite=Lax`, `Secure` behind HTTPS, strict session id mode.
 
-When a reverse proxy terminates TLS, set `[server] trust_proxy = true` and have the proxy send `X-Forwarded-Proto: https`. Enable it only when the app cannot be reached directly, otherwise clients could spoof the header.
+When a reverse proxy terminates TLS, set `server.trust_proxy = true` and have the proxy send `X-Forwarded-Proto: https`. Enable it only when the app cannot be reached directly, otherwise clients could spoof the header.
 
 ```php
 $app->session->set('theme', 'dark');
@@ -326,7 +439,7 @@ Markup helpers return `RawHtml` so the view layer emits them verbatim:
 <body <?= $view->csrf->htmxAttribute() ?>> <!-- hx-headers='{"X-CSRF-Token":"..."}' -->
 ```
 
-Enforcement is **opt-in** via the `verifyCsrf` middleware (checks POST/PUT/PATCH/DELETE against the form field or the `X-CSRF-Token` header, returns 403 on mismatch):
+Enforcement is **opt-in** via the `verifyCsrf` middleware (checks POST/PUT/PATCH/DELETE against `_csrf` in the parsed body — form-encoded or JSON — or the `X-CSRF-Token` header, returns 403 on mismatch):
 
 ```php
 $app->use('verifyCsrf');          // globally
@@ -350,10 +463,14 @@ $app->cache->forget('key');
 $app->cache->flush();                       // returns the number of removed files
 ```
 
-```ini
-[cache]
-path = "cache"
+```php
+// config.php
+return [
+    'cache' => ['path' => 'cache'],   // relative to the app root
+];
 ```
+
+The default is `<app root>/cache`, which is private because the docroot is `public/`.
 
 ---
 
@@ -373,19 +490,21 @@ return [
 ];
 ```
 
-```ini
-[migrations]
-path = "migrations"
+```php
+// config.php
+return [
+    'migrations' => ['path' => 'migrations'],   // relative to the app root
+];
 ```
 
 ---
 
 ## CLI
 
-Monad is not just for HTTP! It includes a built-in micro CLI. Commands are registered on `$app` (in your `index.php` or a bootstrap file) and executed with the `monad` script.
+Monad is not just for HTTP! It includes a built-in micro CLI. Commands are registered on `$app` in the app's `bootstrap.php`, the same file `public/index.php` requires, and executed with the `monad` script. The CLI roots itself at the current working directory, loads `<app root>/bootstrap.php` when present, and then dispatches.
 
 ```php
-// Register a command
+// bootstrap.php
 $app->addCommand('db:reset', function($app, $args) {
     echo "Resetting database...\n";
     $app->db->execute('DROP TABLE IF EXISTS users');
@@ -395,11 +514,11 @@ $app->addCommand('db:reset', function($app, $args) {
 
 You can execute it from the terminal:
 ```bash
-chmod +x monad
-./monad db:reset
+./monad db:reset            # CLI copied into the project
+vendor/bin/monad db:reset   # installed with Composer
 ```
 
-The CLI roots itself at the current working directory, so run it from your app root. It reads that project's `monad.ini` and `migrations/`.
+The CLI reads that project's `config.php`, `bootstrap.php` and `migrations/` — the same files the web entry point uses, which is why configuration lives in a file rather than inside `public/index.php`. When Monad is installed as a dependency, the CLI is also available as `vendor/bin/monad`.
 
 Built-in commands:
 
@@ -420,13 +539,29 @@ Monad is great on its own, but it's also designed to be embeddable. If you `requ
 The app root defaults to the directory of the real entry script, so a project that keeps the engine in a subfolder gets its own config, templates and database:
 
 ```php
-// ../blog/index.php
-$app = require __DIR__ . '/../monad/monad.php';
+// ../blog/public/index.php
+$app = require __DIR__ . '/../../monad/monad.php';
+$app->setRoot(dirname(__DIR__));
 $app->addRoute('GET', '/', fn ($app) => $app->response->render('html.home'));
 $app->dispatch();
 ```
 
-`monad.ini`, `html/`, `db.sqlite`, the cache directory and `migrations/` all resolve from `../blog`, not from the framework checkout. If the entry point is not the app root, call `$app->setRoot('/path/to/app')` before booting.
+`config.php`, `html/`, `db.sqlite`, the cache directory and `migrations/` all resolve from `../blog`, not from the framework checkout. If the entry point is not the app root, call `$app->setRoot('/path/to/app')` before resolving any service.
+
+### Installing via Composer
+
+When the engine is autoloaded instead of required, `$app = require 'monad.php'` is not available: Composer includes the file for its classes and discards the return value, and requiring it a second time would redeclare the engine. `monad.php` is mapped with `classmap`, so boot through the class instead:
+
+```php
+// ../blog/public/index.php
+require dirname(__DIR__) . '/vendor/autoload.php';
+
+$app = Monad\App::boot(dirname(__DIR__));   // the app root, not the docroot
+$app->addRoute('GET', '/', fn ($app) => $app->response->render('html.home'));
+$app->dispatch();
+```
+
+`App::boot()` returns the instance the engine created and points it at the given root (identical roots are a no-op, so resolved services survive). Pick one entry style per app: either require the file directly or boot through Composer, not both.
 
 Global error and exception handlers are installed by `dispatch()`, not when the file is included. Requiring the engine from a cron script therefore does not take over the host process's error handling; call `$app->handleErrors()` if you want the error page without routing.
 
@@ -437,7 +572,8 @@ You can reuse your database connection, configuration, and services in cron jobs
 
 ```php
 // cron.php
-$app = require 'monad.php';
+require __DIR__ . '/vendor/autoload.php';
+$app = Monad\App::boot(__DIR__);
 
 // Reuse the DB service
 $users = $app->db->fetchAll("SELECT * FROM users WHERE active = 0");
@@ -501,57 +637,64 @@ $test->it("handles basic request simulation", function($app, $test) {
   - `->toContain($needle)`: String or array containment.
   - `->toBeInstanceOf($class)`: Class type check.
 - `$test->assertThrows(callable $fn, string $exceptionClass)`: Asserts that code throws a specific exception.
-- `$test->request(string $method, string $uri, array $options = [])`: Simulates an in-process HTTP request. Options: `headers`, `post`, `files`. Returns `{statusCode, headers, body}`.
+- `$test->request(string $method, string $uri, array $options = [])`: Simulates an in-process HTTP request. Options: `headers`, `post`, `files`, `body` (raw request body) and `contentType`. Returns `{statusCode, headers, body}`.
 
 ---
 
-## Configuration (`monad.ini`)
+## Configuration (`config.php`)
 
-The `monad.ini` file manages settings. It is read from the app root (the entry script's directory). Values are loaded into `$app->config` only, parsed with `INI_SCANNER_TYPED` so booleans and numbers keep their types. Nothing is exported to `getenv()` or `$_ENV`, so credentials in the file cannot leak into child processes. Relative paths in `[db]`, `[cache]`, `[migrations]` and `[views]` resolve from the app root.
+`config.php` lives in the app root and returns an array; each key becomes `$app->config->key`. The file is optional — without it the app runs on defaults. It must stay pure data: the container re-executes it on every `reset()`/`setRoot()`, so no side effects and no function declarations.
 
-```ini
-debug = true
+```php
+// config.php
+return [
+    'debug' => true,   // set false before deploying
 
-[server]
-trust_proxy = false
+    'server' => [
+        'trust_proxy' => false,   // honour X-Forwarded-Proto behind a TLS proxy
+    ],
 
-[db]
-path = "db.sqlite"
+    'db' => [
+        'path' => 'db.sqlite',    // SQLite; relative paths resolve from the app root
+    ],
 
-[auth]
-table = "users"
-identifier = "email"
-password = "password"
-loginPath = "/login"
+    // Optional: only when templates live somewhere other than the app root.
+    // 'views' => ['path' => 'tpl'],
 
-[cache]
-path = "cache"
-
-[migrations]
-path = "migrations"
-
-[views]
-path = "views"
+    'auth' => [
+        'table' => 'users',
+        'id' => 'id',
+        'identifier' => 'email',
+        'password' => 'password',
+        'loginPath' => '/login',
+    ],
+];
 ```
 
-The `views` path is optional: templates default to the app root. Putting them outside the docroot (e.g. `path = "views"`) keeps them from being directly requestable over HTTP.
+Omitted keys fall back to the engine's defaults: `debug` is `true`, `db.path` is `db.sqlite`, `cache.path` is `cache`, `migrations.path` is `migrations`, `auth.id` is `id`, and templates resolve from the app root (`html.home` → `<root>/html/home.php`). Relative paths always resolve from the app root, never the working directory. When `views.path` is set, template names are relative to it: with `views.path = 'tpl'`, `home` resolves to `<root>/tpl/home.php`.
+
+Nothing is exported to `getenv()` or `$_ENV`, so values cannot leak into child processes. Because the docroot is `public/`, the file is not reachable over HTTP — and since it is committed rather than generated, there is no setup step.
+
+Per-environment values are still possible without a second config file: `config.php` is ordinary PHP, so it can read an environment variable or check `PHP_SAPI` and return a different array. Keep secrets out of version control by reading them from the environment at this point if you need to; the engine itself never touches `getenv()`.
 
 ---
 
 ## Tips
 
 ### 1. Production Deployment
-Since Monad routes everything through your app's `index.php`, you need to configure your web server (like Nginx or Apache) to send all traffic there.
+Since Monad routes everything through `public/index.php`, point the server's document root at `public/` and send all traffic there. Nothing above that directory is reachable.
 
 Example for **Nginx**:
 ```nginx
+root /var/www/blog/public;
+
 location / {
     try_files $uri $uri/ /index.php?$query_string;
 }
 ```
 
 ### 2. Dev-Friendly Error Page
-When `debug = true` in your `monad.ini`, Monad catches any unhandled exceptions or fatal errors and displays a beautiful, dev-friendly HTML error page showing the exact file, line number, and a full stack trace. When `debug = false` (e.g. in production), it safely hides the details and returns a generic 500 Server Error to protect your application.
+When `debug = true` in `config.php`, Monad catches any unhandled exceptions or fatal errors and displays a beautiful, dev-friendly HTML error page showing the exact file, line number, and a full stack trace. When `debug = false` (e.g. in production), it safely hides the details and returns a generic 500 Server Error to protect your application.
 
 Error handling details:
 * API requests (`Accept: application/json`) get JSON errors instead of HTML.

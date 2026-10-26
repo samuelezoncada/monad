@@ -5,4 +5,10 @@ $app = require __DIR__ . '/monad.php';
 // CLI commands operate on the project you are standing in, not the engine checkout.
 $app->setRoot(getcwd() ?: __DIR__);
 
+// App-level registration lives in bootstrap.php so the HTTP entry point and the
+// CLI share the same routes and commands. It must not be reachable over HTTP.
+$app->handleErrors();
+$bootstrap = $app->root . '/bootstrap.php';
+if (is_file($bootstrap)) require $bootstrap;
+
 $app->dispatch();

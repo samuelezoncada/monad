@@ -1,0 +1,19 @@
+{
+    "name": "monad/fixture-app",
+    "description": "CI fixture: installs Monad as a dependency and boots an app outside the library.",
+    "type": "project",
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../..",
+            "options": {
+                "symlink": true
+            }
+        }
+    ],
+    "require": {
+        "samuelezoncada/monad": "*"
+    }
+}

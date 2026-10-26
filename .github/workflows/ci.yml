@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo, pdo_sqlite, session
+          coverage: none
+
+      - name: Lint
+        run: |
+          php -l monad.php
+          php -l tests.php
+
+      - name: Test suite
+        run: php monad test
+
+  composer-entry:
+    name: Composer entry point
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_sqlite, session
+          coverage: none
+
+      - name: Validate package
+        run: composer validate --strict
+
+      - name: Classmap autoloads the engine
+        run: composer dump-autoload --optimize
+
+      - name: App::boot() works without requiring the file
+        run: |
+          php -r '
+          require "vendor/autoload.php";
+          if (!class_exists("Monad\\App")) { fwrite(STDERR, "Monad\\App did not autoload\n"); exit(1); }
+          $app = Monad\App::boot(getcwd());
+          if ($app->root !== getcwd()) { fwrite(STDERR, "wrong root: {$app->root}\n"); exit(1); }
+          echo "boot ok\n";
+          '
+
+      - name: CLI is executable
+        run: test -x monad
+
+  fixture-app:
+    name: Fixture app (installed package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_sqlite, session
+          coverage: none
+
+      - name: Install the package into the fixture
+        working-directory: tests/fixture-app
+        run: composer install --no-interaction --no-progress
+
+      - name: Migrate through the packaged CLI
+        working-directory: tests/fixture-app
+        run: php vendor/bin/monad migrate
+
+      - name: Run the app's tests through the packaged CLI
+        working-directory: tests/fixture-app
+        run: php vendor/bin/monad test
+
+      - name: Serve the app entry point
+        working-directory: tests/fixture-app
+        run: REQUEST_METHOD=GET REQUEST_URI=/ php public/index.php | grep -q "fixture ok"
+
+      - name: CLI command writes to the app database
+        working-directory: tests/fixture-app
+        run: php vendor/bin/monad notes:add first
+
+      - name: The route reads the new row
+        working-directory: tests/fixture-app
+        run: REQUEST_METHOD=GET REQUEST_URI=/ php public/index.php | grep -q "1 notes"

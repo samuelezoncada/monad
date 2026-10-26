@@ -17,12 +17,12 @@ Use me whenever you are writing or modifying code in a Monad project — adding 
 
 ## Architecture
 
-- **No `src/`, no Composer, no build step.** Everything lives in `index.php` (~1600 lines).
+- **No `src/`, no Composer, no build step.** The engine is a single `monad.php` (~1600 lines); `index.php` is a small app entry point.
 - All framework classes live in the `Monad` namespace (`Monad\App`, `Monad\MagicObject`, `Monad\RawHtml`, ...). App code starts with `use Monad\App;`.
-- `index.php` returns `$app` when `require`d; auto-dispatches only when executed directly. The entry point is detected via `get_included_files()[0]`, so embedding never double-dispatches.
-- CLI entry point: `#!/usr/bin/env php` wrapper that `require`s `index.php` and calls `$app->dispatch()`.
-- Autoloader: `Monad\Foo\Bar` → `./Monad/Foo/Bar.php`. `vendor/autoload.php` auto-detected if present.
-- `monad.ini` is gitignored. Clone flow: `cp monad.example.ini monad.ini`. Values go into `$app->config` and `getenv()`.
+- `monad.php` returns `$app` when `require`d and never dispatches; the entry point calls `$app->dispatch()`. Global handlers are installed by `dispatch()` (or `$app->handleErrors()`), not on include.
+- CLI entry point: `#!/usr/bin/env php` wrapper that `require`s `monad.php`, sets the root to the working directory and calls `$app->dispatch()`.
+- Autoloader: `Monad\Foo\Bar` → `./Monad/Foo/Bar.php` next to the engine; every other namespace loads from the app root. `vendor/autoload.php` is looked up in the app root first.
+- `monad.ini` is gitignored. Clone flow: `cp monad.example.ini monad.ini`. Values go into `$app->config` only (never `getenv()`), and relative paths resolve from the app root.
 - PHP 8.0+, PDO extension. No other dependencies.
 
 ## Commands
@@ -38,7 +38,6 @@ php -S localhost:8000 -t .        # dev server
 ./monad migrate                   # apply pending migrations
 ./monad migrate:rollback          # undo last batch
 ./monad migrate:status            # show ran / pending
-./monad migrate:make users        # scaffold a migration
 ```
 
 ## MagicObject & DI Container

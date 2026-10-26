@@ -1,7 +1,7 @@
 # AGENTS.md
 
-- Monad is a single-file PHP micro-framework. `index.php` is the entire engine. No `src/`, no build step, no Composer required.
-- `index.php` returns `$app` when required. It auto-dispatches only when executed directly.
+- Monad is a single-file PHP micro-framework. `monad.php` is the entire engine; `index.php` is the app entry point. No `src/`, no build step, no Composer required.
+- `monad.php` returns `$app` when required and never dispatches. `index.php` (or the `monad` CLI) calls `$app->dispatch()`.
 - PHP 8.0+, PDO extension. Dev server: `php -S localhost:8000 -t .`
 - `cp monad.example.ini monad.ini` on first clone — `monad.ini` is gitignored. Config is loaded into `$app->config` only (never exported to the environment).
 - `$app->root` is the app directory; `monad.ini`, views, db, cache and migrations resolve from it. It defaults to the entry script's directory; `$app->setRoot()` overrides it. The `monad` CLI uses the working directory. Global handlers are installed by `dispatch()`, not on include.

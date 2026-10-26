@@ -1,11 +1,11 @@
 # Monad
 
-Monad is an experimental, ultra-lightweight PHP micro-framework contained in a single `index.php`. It leverages metaprogramming and PHP magic methods to offer an extremely smooth development experience, focused on modern Server-Side Rendering (SSR) and natively integrated with HTMX.
+Monad is an experimental, ultra-lightweight PHP micro-framework whose entire engine is a single `monad.php`. It leverages metaprogramming and PHP magic methods to offer an extremely smooth development experience, focused on modern Server-Side Rendering (SSR) and natively integrated with HTMX.
 
 Despite the tiny core, it ships a surprisingly complete feature set out of the box: DI container, router with onion middleware, auto-escaping view engine, PDO wrapper, sessions, flash messages, CSRF, authentication, filesystem cache, schema migrations and a built-in test runner.
 
 ## Philosophy
-*   **Monofile Core**: The entire framework engine resides in `index.php`.
+*   **Monofile Core**: The entire framework engine resides in `monad.php`. Your app is a small `index.php` next to it.
 *   **Zero Dependencies**: Works standalone. If you use Composer, `vendor/autoload.php` is automatically detected and integrated.
 *   **HTMX First**: Intelligent layout and HTMX header management to build Single Page Applications (SPA) writing only PHP and HTML.
 *   **Fluent & Recursive View Context**: Security first with a modern twist. Views are recursive objects that provide fluent helpers and automatic XSS protection.
@@ -30,14 +30,16 @@ It is **NOT** recommended for massive enterprise monoliths where strict static t
 ## Quickstart
 Monad requires **PHP 8.0+** and **PDO extension**.
 
-1.  Clone the repository or copy `index.php`.
+1.  Clone the repository (or copy `monad.php` and `index.php` into your project).
 2.  Start the PHP development server:
     ```bash
     php -S localhost:8000 -t .
     ```
 3.  Optional: configure your database, auth, cache and migrations in the `monad.ini` file.
 
-All framework classes live in the `Monad` namespace (declared at the top of `index.php`), so app code typically starts with:
+`monad.php` is the engine and is never edited. `index.php` is your entry point: it requires the engine, registers your routes and calls `$app->dispatch()`.
+
+All framework classes live in the `Monad` namespace (declared at the top of `monad.php`), so app code typically starts with:
 
 ```php
 use Monad\App;
@@ -428,7 +430,7 @@ path = "migrations"
 
 ## CLI
 
-Monad is not just for HTTP! It includes a built-in micro CLI. If you run `index.php` from the terminal, it will route the execution to your registered commands instead of the HTTP routes.
+Monad is not just for HTTP! It includes a built-in micro CLI. Commands are registered on `$app` (in your `index.php` or a bootstrap file) and executed with the `monad` script.
 
 ```php
 // Register a command
@@ -441,14 +443,11 @@ $app->addCommand('db:reset', function($app, $args) {
 
 You can execute it from the terminal:
 ```bash
-php index.php db:reset
-```
-
-Or use the `monad` script and run it directly:
-```bash
 chmod +x monad
 ./monad db:reset
 ```
+
+The CLI roots itself at the current working directory, so run it from your app root. It reads that project's `monad.ini` and `migrations/`.
 
 Built-in commands:
 
@@ -465,13 +464,13 @@ Built-in commands:
 
 ## Embedding Monad in Other Applications
 
-Monad is great on its own, but it's also designed to be embeddable. If you `require` or `include` `index.php` from another script, it will **not** execute the router automatically. Instead, it will return the `$app` instance, allowing you to use Monad as a service container or a library.
+Monad is great on its own, but it's also designed to be embeddable. If you `require` or `include` `monad.php` from another script, it will **not** execute the router. Instead, it will return the `$app` instance, allowing you to use Monad as a service container or a library.
 
 The app root defaults to the directory of the real entry script, so a project that keeps the engine in a subfolder gets its own config, templates and database:
 
 ```php
 // ../blog/index.php
-$app = require __DIR__ . '/../monad/index.php';
+$app = require __DIR__ . '/../monad/monad.php';
 $app->addRoute('GET', '/', fn ($app) => $app->response->render('html.home'));
 $app->dispatch();
 ```
@@ -480,14 +479,14 @@ $app->dispatch();
 
 Global error and exception handlers are installed by `dispatch()`, not when the file is included. Requiring the engine from a cron script therefore does not take over the host process's error handling; call `$app->handleErrors()` if you want the error page without routing.
 
-Auto-dispatch is detected via `get_included_files()[0]` — the real entry script on every SAPI — so embedding from another file never triggers a second, silent dispatch.
+The engine never auto-dispatches: the entry point decides when to run. Running `monad.php` directly does nothing.
 
 ### Use Monad in standalone scripts
 You can reuse your database connection, configuration, and services in cron jobs or background tasks:
 
 ```php
 // cron.php
-$app = require 'index.php';
+$app = require 'monad.php';
 
 // Reuse the DB service
 $users = $app->db->fetchAll("SELECT * FROM users WHERE active = 0");
@@ -605,7 +604,7 @@ The `views` path is optional: templates default to the project root. Putting the
 ## Tips
 
 ### 1. Production Deployment
-Since Monad routes everything through a single file, you need to configure your web server (like Nginx or Apache) to send all traffic to `index.php`.
+Since Monad routes everything through your app's `index.php`, you need to configure your web server (like Nginx or Apache) to send all traffic there.
 
 Example for **Nginx**:
 ```nginx

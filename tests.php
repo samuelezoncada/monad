@@ -55,7 +55,7 @@ $test->beforeEach(function($app) {
  * -------
  * Templates and migrations live in a throwaway directory for the duration of one test.
  * The try/finally matters: with a bare file_put_contents/unlink pair, a failing
- * assertion aborts before the unlink and leaves stray .php files next to index.php.
+ * assertion aborts before the unlink and leaves stray .php files next to the engine.
  */
 
 $useTemplates = function ($app, array $templates, callable $fn) {
@@ -208,7 +208,7 @@ $test->it("App: root anchors config, views, db, cache and migrations", function(
 $test->it("App: a required engine roots at the entry script", function($app, $test) {
     $dir = sys_get_temp_dir() . '/monad-entry-' . bin2hex(random_bytes(4));
     mkdir($dir, 0775, true);
-    $engine = __DIR__ . '/index.php';
+    $engine = __DIR__ . '/monad.php';
     $probe = '<?php $app = require ' . var_export($engine, true)
         . '; echo $app->root, "|", var_export(!empty($app->props()["_handlersInstalled"]), true);';
     file_put_contents($dir . '/app.php', $probe);

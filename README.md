@@ -202,7 +202,7 @@ Templates are resolved using **dot notation** relative to the project root. For 
 <?= $view->partial('partials.header', ['title' => 'Home']) ?>
 <?= $view->dump($data) ?>   <!-- <pre> var_dump, escaped, trusted markup -->
 ```
-Outside templates, use `$app->dump(...)` (or `$app->dd(...)` to die), and `$app->dumpHtml(...)` to get the HTML string.
+Outside templates, use `$app->dump(...)`, and `$app->dumpHtml(...)` to get the HTML string.
 
 ---
 
@@ -329,6 +329,8 @@ When unauthenticated it: redirects to `loginPath` (302) for browser requests, an
 ### Sessions
 Cookies are hardened by default: `HttpOnly`, `SameSite=Lax`, `Secure` behind HTTPS, strict session id mode.
 
+When a reverse proxy terminates TLS, set `[server] trust_proxy = true` and have the proxy send `X-Forwarded-Proto: https`. Enable it only when the app cannot be reached directly, otherwise clients could spoof the header.
+
 ```php
 $app->session->set('theme', 'dark');
 $app->session->get('theme');     // 'dark'
@@ -381,6 +383,8 @@ $app->use('verifyCsrf');          // globally
 ## Caching
 
 A small filesystem cache with atomic writes (temp file + rename, so a concurrent reader never sees a half-written entry).
+
+Values are serialized, but class instantiation is disabled when reading, so only scalars and arrays are cacheable. `set()` (and therefore `remember()`) throws `InvalidArgumentException` if the value contains an object; an object entry written by anything else is treated as a miss.
 
 ```php
 $app->cache->set('key', $value, 3600);     // TTL in seconds; 0 = never expires
@@ -454,7 +458,6 @@ Built-in commands:
 | `./monad migrate` | Apply all pending migrations (one batch) |
 | `./monad migrate:rollback` | Undo the last batch |
 | `./monad migrate:status` | Show which migrations have run / are pending |
-| `./monad migrate:make <name>` | Scaffold a new migration file |
 | `./monad test` | Run the test suite |
 
 ---
@@ -530,7 +533,9 @@ $test->it("DI Container acts as a Singleton", function($app, $test) {
 
 // Simulate in-process HTTP requests
 $test->it("handles basic request simulation", function($app, $test) {
-    $response = $test->request('GET', '/health');
+    $app->addRoute('GET', '/ping', fn($app) => $app->response->json(['ok' => true]));
+
+    $response = $test->request('GET', '/ping');
     $test->expect($response->statusCode)->toEqual(200);
 });
 ```
@@ -552,10 +557,13 @@ $test->it("handles basic request simulation", function($app, $test) {
 
 ## Configuration (`monad.ini`)
 
-The `monad.ini` file manages settings. Monad automatically loads these values into both `$app->config` and **Environment Variables** (`getenv()`).
+The `monad.ini` file manages settings. Values are loaded into `$app->config` only, parsed with `INI_SCANNER_TYPED` so booleans and numbers keep their types. Nothing is exported to `getenv()` or `$_ENV`, so credentials in the file cannot leak into child processes.
 
 ```ini
 debug = true
+
+[server]
+trust_proxy = false
 
 [db]
 path = "db.sqlite"

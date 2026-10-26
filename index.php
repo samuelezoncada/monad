@@ -585,6 +585,39 @@ class App extends MagicObject {
             unset($this->props[$key]);
         }
     }
+
+    /**
+     * True when the request reached the app over HTTPS.
+     *
+     * X-Forwarded-Proto is only honoured when [server] trust_proxy is enabled, so a
+     * client talking to the app directly cannot spoof it. Enable trust_proxy only
+     * when a reverse proxy terminates TLS and the app is not directly reachable.
+     */
+    public function isHttps(): bool {
+        if (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off') {
+            return true;
+        }
+        if ((string) ($_SERVER['SERVER_PORT'] ?? '') === '443') {
+            return true;
+        }
+
+        $server = $this->config->server ?? [];
+        $raw = is_array($server) ? ($server['trust_proxy'] ?? false) : false;
+        // Typed ini values arrive as bools, but a quoted "false" arrives as a
+        // string and `(bool) "false"` is true — that would enable proxy trust.
+        $trustProxy = is_bool($raw) ? $raw : filter_var($raw, FILTER_VALIDATE_BOOLEAN);
+        if (!$trustProxy) {
+            return false;
+        }
+
+        // Trust the last entry: it is the one added by the proxy nearest to us.
+        // A client-supplied value only ends up first if a proxy appends rather
+        // than overwrites, so the leftmost value is the wrong one to believe.
+        $parts = explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+        $proto = strtolower(trim((string) end($parts)));
+
+        return $proto === 'https';
+    }
 }
 
 /**
@@ -669,28 +702,6 @@ EOT;
                 echo "  " . str_pad($name, 40) . " $state\n";
             }
         },
-        'migrate:make' => function ($app, $args = []) {
-            $name = $args[0] ?? null;
-            if (!$name) { echo "Usage: migrate:make <name>\n"; exit(1); }
-            if (!preg_match('/^[a-zA-Z0-9_]+$/', $name)) { echo "Name must be alphanumeric/underscore.\n"; exit(1); }
-            $m = $app->migrator;
-            if (!is_dir($m->dir) && !mkdir($m->dir, 0775, true)) { echo "Cannot create {$m->dir}\n"; exit(1); }
-            $seq = str_pad((string) (count($m->files()) + 1), 3, '0', STR_PAD_LEFT);
-            $path = $m->dir . "/{$seq}_{$name}.php";
-            file_put_contents($path, <<<'TPL'
-            <?php
-            /** Each migration returns up/down closures receiving the DB service. */
-            return [
-                'up' => function ($db) {
-                    $db->execute('CREATE TABLE example (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
-                },
-                'down' => function ($db) {
-                    $db->execute('DROP TABLE IF EXISTS example');
-                },
-            ];
-            TPL);
-            echo "Created " . basename($path) . "\n";
-        },
         'test' => function($app, $args = []) {
             // Separate flags from the positional target: ./monad test tests/ --filter=csrf
             $filter = null;
@@ -749,10 +760,6 @@ EOT;
         }
         echo $app->dumpHtml(...$vars);
     },
-    'dd' => function ($app, ...$vars): void {   // `never` would raise the requirement to PHP 8.1
-        $app->dump(...$vars);
-        exit(1);
-    },
     // The logger follows the same convention as every other MagicObject closure
     // (first argument is the owner). It reads $_SERVER directly rather than the
     // request service, so it stays usable while that very service is failing.
@@ -784,7 +791,7 @@ EOT;
         }
         $path = $prefix . $p;
         $allMw = array_merge($groupMw, $mw);
-        $pattern = '#^' . preg_replace('#:([a-zA-Z_][a-zA-Z0-9_]*)#', '(?P<$1>[^/]+)', $path) . '$#';
+        $pattern = route_pattern($path);
         $this->props['routes'][strtoupper($m)][] = ['path' => $path, 'pattern' => $pattern, 'handler' => $h, 'middleware' => $allMw];
     },
     'addCommand' => function ($app, string $name, callable $handler) {
@@ -1005,26 +1012,39 @@ set_exception_handler(function (Throwable $e) use ($app) {
     $app->renderError($e);
 });
 
+/**
+ * Build a route regex from a path while quoting literal characters. Only
+ * ":name" segments become capture groups.
+ *
+ * @internal
+ */
+function route_pattern(string $path): string
+{
+    $pattern = '';
+    $offset = 0;
+
+    if (preg_match_all('/:([a-zA-Z_][a-zA-Z0-9_]*)/', $path, $matches, PREG_OFFSET_CAPTURE) > 0) {
+        foreach ($matches[0] as $index => $match) {
+            [$placeholder, $position] = $match;
+            $name = $matches[1][$index][0];
+
+            $pattern .= preg_quote(substr($path, $offset, $position - $offset), '#');
+            $pattern .= '(?P<' . $name . '>[^/]+)';
+            $offset = $position + strlen($placeholder);
+        }
+    }
+
+    $pattern .= preg_quote(substr($path, $offset), '#');
+
+    return '#^' . $pattern . '$#';
+}
+
 // --- CORE SERVICES ---
 $app->bind('config', function() {
     $file = __DIR__ . '/monad.ini';
     // INI_SCANNER_TYPED: without it `debug = false` arrived as the string "" and
     // every numeric setting as a string.
     $data = file_exists($file) ? (parse_ini_file($file, true, INI_SCANNER_TYPED) ?: []) : [];
-
-    $setEnv = function($array, $prefix = '') use (&$setEnv) {
-        foreach ($array as $key => $value) {
-            $name = strtoupper($prefix . $key);
-            if (is_array($value)) {
-                $setEnv($value, $name . '_');
-            } else {
-                $flat = is_bool($value) ? ($value ? '1' : '0') : (string) ($value ?? '');
-                putenv("$name=$flat");
-                $_ENV[$name] = $value;
-            }
-        }
-    };
-    $setEnv($data);
 
     return new MagicObject($data ?: [
         'debug' => true, 
@@ -1136,12 +1156,12 @@ $app->bind('migrator', function ($app) {
     ]);
 });
 
-$app->bind('session', function() {
+$app->bind('session', function($app) {
     if (session_status() === PHP_SESSION_NONE) {
         session_start([
             'cookie_httponly' => true,
             'cookie_samesite' => 'Lax',
-            'cookie_secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+            'cookie_secure' => $app->isHttps(),
             'use_strict_mode' => true
         ]);
     }
@@ -1267,7 +1287,15 @@ $app->bind('csrf', function($app) {
             return $tokens[$key];
         },
         'verify' => function ($_, ?string $token, string $key = 'default'): bool {
-            return is_string($token) && hash_equals($_SESSION['_csrf_tokens'][$key] ?? '', $token);
+            $stored = $_SESSION['_csrf_tokens'][$key] ?? '';
+
+            // An empty stored token must never match an empty submitted token:
+            // that would make every first POST in a session CSRF-exempt.
+            return is_string($stored)
+                && $stored !== ''
+                && is_string($token)
+                && $token !== ''
+                && hash_equals($stored, $token);
         },
         // Markup helpers. RawHtml so the view layer emits them verbatim.
         'field' => function ($csrf, string $key = 'default'): RawHtml {
@@ -1297,20 +1325,47 @@ $app->bind('cache', function ($app) {
     }
     $miss = new \stdClass();   // sentinel: distinguishes "absent" from a cached null
 
+    // The read path never instantiates classes, so an object written here could
+    // only ever come back as a miss (and `remember()` would recompute forever).
+    // Reject it at the boundary instead of failing silently later.
+    $containsObject = function ($v) use (&$containsObject): bool {
+        if (is_object($v)) return true;
+        if (is_array($v)) foreach ($v as $item) if ($containsObject($item)) return true;
+        return false;
+    };
+    // Objects nested inside an array also deserialize into __PHP_Incomplete_Class,
+    // so the check has to be recursive for the "object entry is a miss" promise to hold.
+    $containsIncomplete = function ($v) use (&$containsIncomplete): bool {
+        if ($v instanceof \__PHP_Incomplete_Class) return true;
+        if (is_array($v)) foreach ($v as $item) if ($containsIncomplete($item)) return true;
+        return false;
+    };
+
     return new MagicObject([
         'dir' => $dir,
         'path' => fn ($c, string $key): string => $c->dir . '/' . hash('sha256', $key) . '.cache',
-        'get' => function ($c, string $key, mixed $default = null) use ($miss) {
+        'get' => function ($c, string $key, mixed $default = null) use ($miss, $containsIncomplete) {
             $file = $c->path($key);
             if (!is_file($file)) return $default;
             $raw = @file_get_contents($file);
             if ($raw === false) return $default;
-            $entry = @unserialize($raw);
+            // Never instantiate classes from a cache file: a local attacker who
+            // can write here must not be able to trigger __wakeup/__destruct.
+            $entry = @unserialize($raw, ['allowed_classes' => false]);
             if (!is_array($entry) || !array_key_exists('expires', $entry)) return $default;
+            if ($containsIncomplete($entry['value'] ?? null)) {
+                @unlink($file);
+                return $default;
+            }
             if ($entry['expires'] !== 0 && $entry['expires'] < time()) { @unlink($file); return $default; }
             return $entry['value'];
         },
-        'set' => function ($c, string $key, mixed $value, int $ttl = 0): bool {
+        'set' => function ($c, string $key, mixed $value, int $ttl = 0) use ($containsObject): bool {
+            if ($containsObject($value)) {
+                throw new \InvalidArgumentException(
+                    "Cache value for '$key' contains an object; cache scalars and arrays only."
+                );
+            }
             $file = $c->path($key);
             $tmp = $file . '.' . bin2hex(random_bytes(6));
             $payload = serialize(['expires' => $ttl > 0 ? time() + $ttl : 0, 'value' => $value]);
@@ -1343,7 +1398,6 @@ $app->bind('request', function($app) {
         'params' => [],
         'getQueryVar' => fn($_, string $n, mixed $d = null) => $_GET[$n] ?? $d,
         'getPostVar' => fn ($_, string $n, mixed $d = null) => $_POST[$n] ?? $d,
-        'getFile' => fn ($_, string $n) => $_FILES[$n] ?? null,
         'getHeader' => $getHeader,
         'body' => function () { static $c = null; if ($c === null) $c = file_get_contents('php://input'); return $c; },
         'htmx' => new MagicObject([
@@ -1365,12 +1419,14 @@ $app->bind('response', function($app) {
         foreach (($res->app->props()['shared'] ?? []) as $name => $factory) {
             $lazyGlobals[$name] = fn () => $factory($res->app);
         }
+        // Keep the session lazy as well: rendering a public page must not start
+        // an anonymous session just because a template may look at flash data.
+        $lazyGlobals['session'] = fn () => $res->app->session;
         return new ViewContext(array_merge(
             ['data' => $data],
             [
                 'config' => $res->app->config,
                 'request' => $res->app->request,
-                'session' => $res->app->session,
                 // RawHtml marks this as trusted markup: the view layer must not escape it.
                 'partial' => fn ($_, string $n, array $d = []) => new RawHtml($res->partial($n, $d)),
                 'dump' => fn ($_, ...$vars) => new RawHtml($res->app->dumpHtml(...$vars)),
@@ -1549,19 +1605,13 @@ $app->bind('verifyCsrf', function ($app, $next) {
     $next($app);
 });
 
+/** Opt-in request logging: $app->use('log'). */
 $app->bind('log', function ($app, $next) {
     $start = microtime(true);
     $next($app);
     $ms = number_format((microtime(true) - $start) * 1000, 2);
     $app->logger("{$app->response->statusCode} ({$ms}ms)");
 });
-
-
-$app->use('log');
-
-// --- ROUTES ---
-
-$app->addRoute('GET', '/health', fn($app) => $app->response->json(['ok' => true, 'time' => date(DATE_ATOM)]));
 
 // Catch fatal runtime errors (like E_ERROR or E_PARSE) that bypass standard try/catch blocks,
 // and route them safely through the application's central error handling system.

@@ -166,6 +166,39 @@ $test->it("Session: destroy clears everything", function($app, $test) {
     $test->expect($app->session->get('secret'))->toEqual(null);
 });
 
+$test->it("App: isHttps() detects direct TLS and trusted proxies", function($app, $test) {
+    $backup = $_SERVER;
+    try {
+        $_SERVER['SERVER_PORT'] = '80';
+        unset($_SERVER['HTTPS'], $_SERVER['HTTP_X_FORWARDED_PROTO']);
+
+        $app->config->server = ['trust_proxy' => false];
+        $_SERVER['HTTPS'] = 'on';
+        $test->expect($app->isHttps())->toBeTrue();
+
+        unset($_SERVER['HTTPS']);
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'https';
+        $test->expect($app->isHttps())->toBeFalse(); // proxy not trusted
+
+        $app->config->server = ['trust_proxy' => true];
+        $test->expect($app->isHttps())->toBeTrue();
+
+        // Only the hop nearest us counts: a client-supplied first value is not trusted.
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'https, http';
+        $test->expect($app->isHttps())->toBeFalse();
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'http, https';
+        $test->expect($app->isHttps())->toBeTrue();
+
+        // A quoted ini value ("false") is a string, and (bool) "false" is true.
+        $app->config->server = ['trust_proxy' => 'false'];
+        $_SERVER['HTTP_X_FORWARDED_PROTO'] = 'https';
+        $test->expect($app->isHttps())->toBeFalse();
+    } finally {
+        $_SERVER = $backup;
+        $app->config->server = ['trust_proxy' => false];
+    }
+});
+
 // --- 3. CSRF ---
 $test->it("CSRF: generates and verifies tokens", function($app, $test) {
     $token = $app->csrf->token('test');
@@ -183,6 +216,11 @@ $test->it("CSRF: rejects wrong and missing tokens", function($app, $test) {
     $app->csrf->token('form');
     $test->expect($app->csrf->verify('wrong', 'form'))->toBeFalse();
     $test->expect($app->csrf->verify(null, 'form'))->toBeFalse();
+});
+
+$test->it("CSRF: rejects an empty token when no token exists", function($app, $test) {
+    // hash_equals('', '') used to make the first POST in a session CSRF-exempt.
+    $test->expect($app->csrf->verify('', 'never-issued'))->toBeFalse();
 });
 
 $test->it("CSRF: the token store is capped", function($app, $test) {
@@ -240,6 +278,14 @@ $test->it("Router: handles groups and middleware", function($app, $test) {
     $routes = $app->props()['routes']['POST'] ?? [];
     $r = array_values(array_filter($routes, fn($r) => $r['path'] === '/api/v1/data'))[0];
     $test->expect(in_array('mw1', $r['middleware']))->toBeTrue();
+});
+
+$test->it("Router: quotes literal dots and regex characters", function($app, $test) {
+    $app->addRoute('GET', '/feed.xml+1', fn($app) => $app->response->text('ok'));
+
+    $test->expect($test->request('GET', '/feed.xml+1')->statusCode)->toEqual(200);
+    $test->expect($test->request('GET', '/feedXxml+1')->statusCode)->toEqual(404);
+    $test->expect($test->request('GET', '/feed.xml+11')->statusCode)->toEqual(404);
 });
 
 $test->it("Router: maintains middleware execution order (Onion pattern)", function($app, $test) {
@@ -559,6 +605,23 @@ $test->it("View: shared globals are reachable and escaped in templates", functio
     });
 });
 
+$test->it("View: session is resolved lazily and still reachable", function($app, $test) use ($useTemplates) {
+    $useTemplates($app, ['sess' => '<p><?= $view->session->get("name") ?></p>'], function () use ($app, $test) {
+        $app->session->set('name', 'Ada');
+        $app->addRoute('GET', '/sess', fn($app) => $app->response->render('sess'));
+        $test->expect($test->request('GET', '/sess')->body)->toContain('<p>Ada</p>');
+    });
+});
+
+$test->it("View: a template that ignores the session does not start one", function($app, $test) use ($useTemplates) {
+    $useTemplates($app, ['public' => '<p>hello</p>'], function () use ($app, $test) {
+        $app->addRoute('GET', '/public', fn($app) => $app->response->render('public'));
+        $test->expect($test->request('GET', '/public')->body)->toContain('<p>hello</p>');
+        // Resolved services are cached as props, so this proves the render never touched it.
+        $test->expect(array_key_exists('session', $app->props()))->toBeFalse();
+    });
+});
+
 /*
  * These two cover bugs that only a real render exposed: wrapping a service in a copy of
  * its props rebound its closures to the wrapper, so the service read its *own* state
@@ -623,12 +686,6 @@ $test->it("Response: json() sets Content-Type header", function($app, $test) {
     $res = $test->request('GET', '/api-data');
     $test->expect($res->getHeader('Content-Type'))->toEqual('application/json; charset=utf-8');
     $test->expect($res->body)->toEqual('{"status":"ok"}');
-});
-
-$test->it("Response: the built-in /health route answers", function($app, $test) {
-    $res = $test->request('GET', '/health');
-    $test->expect($res->statusCode)->toEqual(200);
-    $test->expect($res->body)->toContain('"ok":true');
 });
 
 $test->it("Response: layout skipped during HTMX requests", function($app, $test) use ($useTemplates) {
@@ -808,6 +865,31 @@ $test->it("Cache: a corrupt file is treated as a miss, not an error", function($
     $app->cache->set('bad', 'value');
     file_put_contents($app->cache->path('bad'), 'this is not serialized data');
     $test->expect($app->cache->get('bad', 'fallback'))->toEqual('fallback');
+});
+
+$test->it("Cache: object payloads are not instantiated", function($app, $test) {
+    $file = $app->cache->path('object');
+    file_put_contents($file, serialize(['expires' => 0, 'value' => new \stdClass()]));
+
+    $test->expect($app->cache->get('object', 'fallback'))->toEqual('fallback');
+    $test->expect(is_file($file))->toBeFalse(); // incomplete entries are dropped
+});
+
+$test->it("Cache: writing an object fails loudly instead of never hitting", function($app, $test) {
+    $test->assertThrows(fn() => $app->cache->set('obj', new \stdClass()), \InvalidArgumentException::class);
+    $test->assertThrows(fn() => $app->cache->set('nested', ['a' => [new \stdClass()]]), \InvalidArgumentException::class);
+    // remember() must not silently recompute forever.
+    $test->assertThrows(fn() => $app->cache->remember('obj', 0, fn() => new \stdClass()), \InvalidArgumentException::class);
+
+    $test->expect($app->cache->get('obj', 'fallback'))->toEqual('fallback');
+});
+
+$test->it("Cache: nested objects in a legacy entry count as a miss", function($app, $test) {
+    $file = $app->cache->path('nested-legacy');
+    file_put_contents($file, serialize(['expires' => 0, 'value' => ['a' => new \stdClass()]]));
+
+    $test->expect($app->cache->get('nested-legacy', 'fallback'))->toEqual('fallback');
+    $test->expect(is_file($file))->toBeFalse();
 });
 
 // --- 12. CLI ---

@@ -154,8 +154,6 @@ interface Response {
 interface View extends \IteratorAggregate, \ArrayAccess, \Countable {}
 
 /**
- * @method string number(int $decimals = 0)
- * @method string date(string $format = 'Y-m-d')
  * @method mixed default(mixed $fallback)
  * @method string json()
  * @method mixed raw()
@@ -165,12 +163,6 @@ class MagicValue implements \Stringable, \JsonSerializable {
     /** Defence in depth: an escaped value reaching json_encode used to serialise as {}. */
     public function jsonSerialize(): mixed { return $this->v; }
     public function __toString(): string { return htmlspecialchars((string)($this->v ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
-    public function number(int $d = 0): string { return number_format((float)($this->v ?? 0), $d); }
-    public function date(string $f = 'Y-m-d'): string {
-        if (is_numeric($this->v)) return date($f, (int) $this->v);
-        $ts = strtotime((string) ($this->v ?? 'now'));
-        return $ts === false ? '' : date($f, $ts); // unparseable input must not fall back to the epoch
-    }
     public function default(mixed $f): mixed { return empty($this->v) ? new MagicValue($f) : $this; }
     public function json(): string { $j = json_encode($this->v); if ($j === false) throw new \RuntimeException('JSON encoding failed: ' . json_last_error_msg()); return htmlspecialchars($j, ENT_QUOTES, 'UTF-8'); }
     public function raw() { return $this->v; }
@@ -230,7 +222,7 @@ class MagicObject {
  * context-aware HTML escaping on string output via MagicValue, while allowing
  * nested data objects/arrays to also remain wrapped.
  */
-class ViewContext extends MagicObject implements View {
+class ViewContext extends MagicObject implements View, \JsonSerializable {
     /** Unlike the container, views stay lenient: a missing key yields null instead of throwing. */
     public function __get(string $name): mixed {
         return $this->wrap($this->__isset($name) ? parent::__get($name) : null);
@@ -256,9 +248,20 @@ class ViewContext extends MagicObject implements View {
         // Service objects ($session, $request, $auth) were previously handed over raw,
         // which silently bypassed escaping for anything read through them.
         if ($v instanceof MagicObject) return new ViewProxy($v);
-        if (is_bool($v)) return $v; // never wrap booleans: `if ($view->request->htmx->is)` must stay honest
-        return (is_object($v) || $v === null) ? $v : new MagicValue($v);
+        // Only strings can carry markup. Wrapping ints/floats/bools/null made `>`
+        // throw, `empty()` always false and every value truthy, while escaping them
+        // was a no-op anyway.
+        return is_string($v) ? new MagicValue($v) : $v;
     }
+
+    /**
+     * True when the wrapped array has no entries. `empty($view->data->items)` cannot
+     * work because a ViewContext is an object, and objects are never empty.
+     */
+    public function isEmpty(): bool { return count($this->props()) === 0; }
+
+    /** Lets `json_encode($view->data->items)` emit the array instead of `{}`. */
+    public function jsonSerialize(): mixed { return $this->props(); }
     public function getIterator(): \Traversable { foreach ($this->props as $k => $v) yield $k => $this->__get($k); }
     public function offsetExists($o): bool { return isset($this->props[$o]); }
     public function offsetGet($o): mixed { return $this->__get($o); }

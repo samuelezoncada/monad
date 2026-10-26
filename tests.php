@@ -491,10 +491,37 @@ $test->it("View: auto-escaping works in templates", function($app, $test) use ($
     });
 });
 
-$test->it("View: fluent number() formats decimals", function($app, $test) use ($useTemplates) {
-    $useTemplates($app, ['test_num' => '<?= $view->data->val->number(2) ?>'], function () use ($app, $test) {
-        $test->expect($app->response->partial('test_num', ['val' => 10]))->toEqual('10.00');
+$test->it("View: numbers are native, so operators and native functions work", function($app, $test) use ($useTemplates) {
+    $useTemplates($app, ['test_native' => '<?= number_format($view->data->price, 2) ?> <?= $view->data->count > 0 ? "yes" : "no" ?>'], function () use ($app, $test) {
+        $out = $app->response->partial('test_native', ['price' => 10.5, 'count' => 0]);
+        $test->expect($out)->toEqual('10.50 no');   // a MagicValue threw on both
     });
+});
+
+$test->it("View: zero, false and null stay native", function($app, $test) {
+    $view = new ViewContext(['zero' => 0, 'flag' => false, 'none' => null]);
+
+    $test->expect($view->zero)->toEqual(0);
+    $test->expect($view->zero > 0)->toBeFalse();   // comparing a MagicValue to int used to throw
+    $test->expect($view->flag)->toBeFalse();
+    $test->expect($view->none)->toEqual(null);
+    $test->expect(empty($view->zero))->toBeTrue();
+});
+
+$test->it("View: arrays JSON-encode and report emptiness", function($app, $test) {
+    $view = new ViewContext(['items' => [1, 2], 'none' => []]);
+
+    $test->expect(json_encode($view->items))->toEqual('[1,2]');
+    $test->expect(json_encode($view->none))->toEqual('[]');   // used to be {}
+    $test->expect($view->none->isEmpty())->toBeTrue();
+    $test->expect($view->items->isEmpty())->toBeFalse();
+});
+
+$test->it("View: strings still escape and support default()", function($app, $test) {
+    $view = new ViewContext(['name' => '', 'greeting' => '<b>hi</b>']);
+
+    $test->expect((string) $view->greeting)->toEqual('&lt;b&gt;hi&lt;/b&gt;');
+    $test->expect((string) $view->name->default('anon'))->toEqual('anon');
 });
 
 $test->it("View: layouts wrap templates correctly", function($app, $test) use ($useTemplates) {
@@ -517,17 +544,6 @@ $test->it("View: MagicValue json() throws on non-serializable value", function($
         $v = new MagicValue(fopen('php://memory', 'r'));
         $v->json();
     }, \RuntimeException::class);
-});
-
-$test->it("View: MagicValue date() formats timestamps", function($app, $test) use ($useTemplates) {
-    $useTemplates($app, ['test_date' => '<?= $view->data->ts->date("Y") ?>'], function () use ($app, $test) {
-        $test->expect($app->response->partial('test_date', ['ts' => strtotime('2024-03-15')]))->toEqual('2024');
-    });
-});
-
-$test->it("View: MagicValue date() returns an empty string on unparseable input", function($app, $test) {
-    // date($f, false) used to silently render the Unix epoch
-    $test->expect((new MagicValue('not a date'))->date())->toEqual('');
 });
 
 $test->it("View: an escaped value encodes to its raw form in JSON", function($app, $test) {

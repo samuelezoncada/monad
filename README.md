@@ -149,7 +149,7 @@ Routing behaviors:
 
 ## Views and Templates
 
-PHP is your templating engine, and Monad makes it safe and elegant. Data passed to the view is wrapped in a **recursive** context that provides automatic escaping and fluent helpers.
+PHP is your templating engine, and Monad makes it safe and elegant. Data passed to the view is wrapped in a **recursive** context: strings are escaped automatically, while numbers, booleans and `null` stay native PHP values.
 
 ### Rendering
 ```php
@@ -167,13 +167,13 @@ $app->response->render('html.pages.home', [
 <!-- Automatic Escaping (XSS Protected) -->
 <h1>Welcome, <?= $view->data->user->name ?></h1>
 
-<!-- Fluent Helpers -->
-<p>Balance: <?= $view->data->user->balance->number(2) ?> €</p>
+<!-- Numbers stay native PHP values -->
+<p>Balance: <?= number_format($view->data->user->balance, 2) ?> €</p>
 
 <!-- Recursive Loops -->
 <ul>
     <?php foreach ($view->data->items as $item): ?>
-        <li><?= $item->name ?>: <?= $item->price->number(2) ?> €</li>
+        <li><?= $item->name ?>: <?= number_format($item->price, 2) ?> €</li>
     <?php endforeach; ?>
 </ul>
 
@@ -191,10 +191,11 @@ $app->response->render('html.pages.home', [
 Templates are resolved using **dot notation** relative to the project root. For example, `html.admin.dashboard` maps to `./html/admin/dashboard.php`. Template names are validated (no slashes, no `..`) so they can never escape the view root.
 
 ### Escaping semantics
-* Values are wrapped in `MagicValue`, whose `__toString()` HTML-escapes automatically. Helpers: `->number($d)`, `->date($fmt)`, `->default($fallback)`, `->json()`, `->raw()`.
+* Strings are wrapped in `MagicValue`, whose `__toString()` HTML-escapes automatically. Helpers on strings: `->default($fallback)`, `->json()`, `->raw()`.
+* Numbers, floats, booleans and `null` stay native, so `number_format($view->data->price, 2)`, `date('Y', $view->data->ts)`, `$view->data->count > 0` and `empty($view->data->zero)` behave exactly like plain PHP.
 * `MagicValue` implements `Stringable` and `JsonSerializable`: a value that was escaped still serializes to its raw form in `json_encode` (previously it came out as `{}`).
-* `->date()` returns an empty string on unparseable input instead of silently falling back to the Unix epoch.
-* Service objects reached from a template (`$view->request`, `$view->session`, `$view->auth`) are wrapped in a `ViewProxy` so values read *through* them are escaped too, while booleans stay real booleans (`if ($view->request->htmx->is)` stays honest).
+* Arrays are wrapped in `ViewContext` so their elements are escaped on read. A wrapped array is an object, so `empty()` cannot describe it: use `count($view->data->items)` or `$view->data->items->isEmpty()`. `ViewContext` is `JsonSerializable`, so `json_encode($view->data->items)` emits the array.
+* Service objects reached from a template (`$view->request`, `$view->session`, `$view->auth`) are wrapped in a `ViewProxy` so values read *through* them are escaped too.
 * Markup that is already safe is returned as `RawHtml` and emitted verbatim: `$view->partial(...)`, `$view->dump(...)` and the CSRF helpers.
 
 ### Partials & debugging

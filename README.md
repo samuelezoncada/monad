@@ -5,13 +5,11 @@ Monad is an experimental, ultra-lightweight PHP micro-framework whose entire eng
 Despite the tiny core, it ships a surprisingly complete feature set out of the box: DI container, router with onion middleware, auto-escaping view engine, PDO wrapper, sessions, flash messages, CSRF, authentication, filesystem cache, schema migrations and a built-in test runner.
 
 ## Philosophy
-*   **Monofile Core**: The entire framework engine resides in `monad.php`. Your app is a small `index.php` next to it.
-*   **Zero Dependencies**: Works standalone. If you use Composer, `vendor/autoload.php` is automatically detected and integrated.
-*   **HTMX First**: Intelligent layout and HTMX header management to build Single Page Applications (SPA) writing only PHP and HTML.
-*   **Fluent & Recursive View Context**: Security first with a modern twist. Views are recursive objects that provide fluent helpers and automatic XSS protection.
-*   **Onion Middleware**: A recursive middleware system that allows processing requests both "on the way in" and "on the way out".
-*   **Batteries Included**: Sessions, flash messages, CSRF, auth, caching and migrations are built-in and opt-in.
-*   **MagicObject**: The heart of Monad. It allows defining dynamic behaviors and lazy-loading with a clean and expressive syntax.
+*   **Monofile Core**: the entire engine resides in `monad.php`; your app is a small `index.php` next to it.
+*   **Zero Dependencies**: works standalone; Composer's `vendor/autoload.php` is used if present.
+*   **HTMX First**: layouts are skipped on HTMX requests and `HX-*` headers are managed for you.
+*   **Onion Middleware**: process requests on the way in and on the way out.
+*   **Batteries Included**: sessions, flash, CSRF, auth, cache and migrations are built-in and opt-in.
 
 ---
 
@@ -50,68 +48,25 @@ use Monad\RawHtml;
 
 ---
 
-## The `MagicObject`
+## `MagicObject` & Services
 
-The power of Monad comes from the `MagicObject` class, allowing you to create dynamic and expressive objects. Every framework service (App, Request, Response, DB) is a `MagicObject`.
-
-`MagicObject`s allow you to define properties and closures that are resolved dynamically and "bound" to the instance.
-
-```php
-$app = new App([
-    // Closures are executed in the App context
-    'greet' => function($app, $name) {
-        return "Hello $name!";
-    }
-]);
-
-echo $app->greet('World');
-```
-
-## Services
-Monad acts as a giant Dependency Injection (DI) Container.
-You can register your own services using `$app->bind()` and access them using magic properties.
+Every framework service (App, Request, Response, DB) is a `MagicObject`: properties and closures are resolved lazily and bound to the instance. Factory closures receive `$app`, and `$this` is the instance, so services can chain each other.
 
 ```php
 $app->bind('myService', function($app) {
     return new MyService();
 });
+$app->myService->sayHello();   // resolved once, then cached
 
-$app->myService->sayHello();
+// Bind by class name for autocompletion:
+$app->bind(MyService::class, fn($app) => new MyService());
+$app->get(MyService::class)->sayHello();
 ```
 
-This works, but you won't get any autocompletion for it. To fix that, just use the class/interface name as binding key and then retrieve the service using `$app->get()`:
-
-```php
-$app->bind(MyService::class, function($app) {
-    return new MyService();
-});
-
-$myService = $app->get(MyService::class);
-$myService->sayHello(); // Autocomplete works fine :)
-```
-You can even override default services just by binding them again:
-```php
-// Re-bind the internal db service to your custom implementation
-$app->bind('db', function($app) {
-    return new MyCustomDB(); // Must implement Monad\DB interface!
-});
-
-// Now you can use your custom DB implementation
-$app->db->select('users', ['id' => 1]);
-``` 
-Just remember that when overriding internal services, custom services **must implement Monad interfaces** (i.e. `Monad\DB`) and you won't get any custom methods autocompletion for them.
-
-Services are singletons: a factory runs once and the result is cached. Call `$app->reset()` to clear all resolved instances and force re-resolution.
+Services are singletons; `$app->reset()` clears resolved instances. Override an internal service by rebinding the same name — the replacement must implement the matching `Monad\*` interface (e.g. `Monad\DB`).
 
 ### Shared view globals
-Expose a lazily-resolved global to every template with `$app->share()`:
-
-```php
-$app->share('stats', fn($app) => new StatsService());
-// In any template: $view->stats->today()
-```
-
-Globals resolve lazily (declaring one costs nothing until a template touches it). `auth`, `flash` and `csrf` are already shared for you.
+`$app->share('stats', fn($app) => new StatsService())` exposes `$view->stats` to every template, resolved lazily. `auth`, `flash` and `csrf` are already shared.
 
 ---
 
@@ -195,7 +150,7 @@ Templates are resolved using **dot notation** relative to the app root. For exam
 ### Escaping semantics
 * Strings are wrapped in `MagicValue`, whose `__toString()` HTML-escapes automatically. Helpers on strings: `->default($fallback)`, `->json()`, `->raw()`.
 * Numbers, floats, booleans and `null` stay native, so `number_format($view->data->price, 2)`, `date('Y', $view->data->ts)`, `$view->data->count > 0` and `empty($view->data->zero)` behave exactly like plain PHP.
-* `MagicValue` implements `Stringable` and `JsonSerializable`: a value that was escaped still serializes to its raw form in `json_encode` (previously it came out as `{}`).
+* `MagicValue` implements `Stringable` and `JsonSerializable`: an escaped value still serializes to its raw form in `json_encode`.
 * Arrays are wrapped in `ViewContext` so their elements are escaped on read. A wrapped array is an object, so `empty()` cannot describe it: use `count($view->data->items)` or `$view->data->items->isEmpty()`. `ViewContext` is `JsonSerializable`, so `json_encode($view->data->items)` emits the array.
 * Service objects reached from a template (`$view->request`, `$view->session`, `$view->auth`) are wrapped in a `ViewProxy` so values read *through* them are escaped too.
 * Markup that is already safe is returned as `RawHtml` and emitted verbatim: `$view->partial(...)`, `$view->dump(...)` and the CSRF helpers.
@@ -211,18 +166,15 @@ Outside templates, use `$app->dump(...)`, and `$app->dumpHtml(...)` to get the H
 
 ## HTMX Integration
 
-[HTMX](https://htmx.org) is a powerful frontend library that allows you to access AJAX, WebSockets, and Server Sent Events directly in HTML, using standard attributes.
+Monad knows when a request comes from HTMX (`$app->request->htmx->is`). Calling `$app->response->render(...)` during an HTMX request **automatically skips the layout**, returning only the requested fragment.
 
-Monad is designed from the ground up to pair perfectly with HTMX. It knows when a request comes from HTMX (`$app->request->htmx->is`).
-If you call `$app->response->render(...)` during an HTMX request, the main `layout` is **automatically ignored**, returning only the requested HTML fragment!
+Send commands to the frontend through the response's magic `htmx` object — any property becomes an `HX-*` response header:
 
-Furthermore, you can send commands to the HTMX frontend using the Response's magic `htmx` object:
 ```php
 // Trigger a JS event on the client
 $app->response->htmx->trigger = 'updateList';
 $app->response->render('user_list', [...]);
 ```
-Any property set on `$app->response->htmx` becomes an `HX-*` response header.
 
 ### HTMX-specific response helpers
 ```php
@@ -526,29 +478,15 @@ Test files are completely free of setup boilerplate. The CLI automatically boots
 Example (`tests.php`):
 
 ```php
-// Setup hooks run before/after each test case (they accumulate)
-$test->beforeEach(function($app) {
-    $app->config->db = ['path' => ':memory:'];
-});
-$test->beforeAll(function($app) {
-    // runs once, before the first test
-});
-$test->afterAll(function($app) {
-    // runs once, after the last test
-});
+// Hooks run around each case (they accumulate)
+$test->beforeEach(fn($app) => $app->config->db = ['path' => ':memory:']);
 
-// Register a test case
-$test->it("DI Container acts as a Singleton", function($app, $test) {
-    $app->bind('rand', fn() => rand(1, 1000000));
-    $test->expect($app->rand)->toEqual($app->rand);
-});
-
-// Simulate in-process HTTP requests
 $test->it("handles basic request simulation", function($app, $test) {
     $app->addRoute('GET', '/ping', fn($app) => $app->response->json(['ok' => true]));
 
-    $response = $test->request('GET', '/ping');
-    $test->expect($response->statusCode)->toEqual(200);
+    $res = $test->request('GET', '/ping');
+    $test->expect($res->statusCode)->toEqual(200);
+    $test->expect($res->body)->toContain('"ok":true');
 });
 ```
 

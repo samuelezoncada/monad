@@ -153,6 +153,78 @@ $test->it("DI Container: share() registers a lazy view global", function($app, $
     $test->expect($resolved)->toEqual(0);   // never touched by a template => never resolved
 });
 
+// --- 1b. APP ROOT ---
+$test->it("App: root anchors config, views, db, cache and migrations", function($app, $test) {
+    $old = $app->root;
+    $dir = sys_get_temp_dir() . '/monad-root-' . bin2hex(random_bytes(4));
+    $rm = function (string $path) use (&$rm) {
+        if (is_dir($path)) {
+            foreach (scandir($path) ?: [] as $entry) {
+                if ($entry !== '.' && $entry !== '..') $rm($path . '/' . $entry);
+            }
+            @rmdir($path);
+        } else {
+            @unlink($path);
+        }
+    };
+
+    mkdir($dir . '/tpl', 0775, true);
+    mkdir($dir . '/data', 0775, true);
+    file_put_contents($dir . '/monad.ini', <<<'INI'
+        [app]
+        name = "blog"
+        [views]
+        path = "tpl"
+        [db]
+        path = "data/app.sqlite"
+        [cache]
+        path = "var/cache"
+        [migrations]
+        path = "db/migrations"
+        INI);
+    file_put_contents($dir . '/tpl/hello.php', 'Hello <?= $view->data->name ?>');
+
+    try {
+        $app->setRoot($dir);
+
+        $test->expect($app->root)->toEqual($dir);
+        $test->expect($app->config->app['name'])->toEqual('blog');
+        $test->expect($app->response->partial('hello', ['name' => '<b>Sam</b>']))
+             ->toEqual('Hello &lt;b&gt;Sam&lt;/b&gt;');
+
+        $test->expect($app->cache->dir)->toEqual($dir . '/var/cache');
+        $test->expect(is_dir($dir . '/var/cache'))->toBeTrue();
+
+        $app->db->execute('CREATE TABLE t (id INTEGER)');
+        $test->expect(is_file($dir . '/data/app.sqlite'))->toBeTrue();
+
+        $test->expect($app->migrator->dir)->toEqual($dir . '/db/migrations');
+    } finally {
+        $app->setRoot($old);
+        $rm($dir);
+    }
+});
+
+$test->it("App: a required engine roots at the entry script", function($app, $test) {
+    $dir = sys_get_temp_dir() . '/monad-entry-' . bin2hex(random_bytes(4));
+    mkdir($dir, 0775, true);
+    $engine = __DIR__ . '/index.php';
+    $probe = '<?php $app = require ' . var_export($engine, true)
+        . '; echo $app->root, "|", var_export(!empty($app->props()["_handlersInstalled"]), true);';
+    file_put_contents($dir . '/app.php', $probe);
+
+    try {
+        // A separate process is the only honest way to boot the engine from another entry point.
+        $out = shell_exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($dir . '/app.php') . ' 2>&1');
+        // Root follows the entry script, and merely requiring the engine must not
+        // install global error handlers (only dispatch() does that).
+        $test->expect(trim((string) $out))->toEqual(realpath($dir) . '|false');
+    } finally {
+        @unlink($dir . '/app.php');
+        @rmdir($dir);
+    }
+});
+
 // --- 2. SESSION ---
 $test->it("Session: stores and retrieves values", function($app, $test) {
     $app->session->set('user_id', 42);

@@ -1,2 +1,8 @@
 #!/usr/bin/env php
-<?php $app = require __DIR__ . '/index.php'; $app->dispatch();
+<?php
+$app = require __DIR__ . '/index.php';
+
+// CLI commands operate on the project you are standing in, not the engine checkout.
+$app->setRoot(getcwd() ?: __DIR__);
+
+$app->dispatch();

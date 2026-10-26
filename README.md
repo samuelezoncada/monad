@@ -467,6 +467,19 @@ Built-in commands:
 
 Monad is great on its own, but it's also designed to be embeddable. If you `require` or `include` `index.php` from another script, it will **not** execute the router automatically. Instead, it will return the `$app` instance, allowing you to use Monad as a service container or a library.
 
+The app root defaults to the directory of the real entry script, so a project that keeps the engine in a subfolder gets its own config, templates and database:
+
+```php
+// ../blog/index.php
+$app = require __DIR__ . '/../monad/index.php';
+$app->addRoute('GET', '/', fn ($app) => $app->response->render('html.home'));
+$app->dispatch();
+```
+
+`monad.ini`, `html/`, `db.sqlite`, the cache directory and `migrations/` all resolve from `../blog`, not from the framework checkout. If the entry point is not the project root, call `$app->setRoot('/path/to/app')` before booting.
+
+Global error and exception handlers are installed by `dispatch()`, not when the file is included. Requiring the engine from a cron script therefore does not take over the host process's error handling; call `$app->handleErrors()` if you want the error page without routing.
+
 Auto-dispatch is detected via `get_included_files()[0]` — the real entry script on every SAPI — so embedding from another file never triggers a second, silent dispatch.
 
 ### Use Monad in standalone scripts
@@ -558,7 +571,7 @@ $test->it("handles basic request simulation", function($app, $test) {
 
 ## Configuration (`monad.ini`)
 
-The `monad.ini` file manages settings. Values are loaded into `$app->config` only, parsed with `INI_SCANNER_TYPED` so booleans and numbers keep their types. Nothing is exported to `getenv()` or `$_ENV`, so credentials in the file cannot leak into child processes.
+The `monad.ini` file manages settings. It is read from the app root (the entry script's directory). Values are loaded into `$app->config` only, parsed with `INI_SCANNER_TYPED` so booleans and numbers keep their types. Nothing is exported to `getenv()` or `$_ENV`, so credentials in the file cannot leak into child processes. Relative paths in `[db]`, `[cache]`, `[migrations]` and `[views]` resolve from the app root.
 
 ```ini
 debug = true

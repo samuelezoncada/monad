@@ -590,6 +590,16 @@ class App extends MagicObject {
     }
 
     /**
+     * Points the app at a different project directory. monad.ini, views, the
+     * database, cache and migrations all resolve from here. Call it before
+     * booting; already-resolved services are discarded.
+     */
+    public function setRoot(string $dir): void {
+        $this->props['root'] = rtrim($dir, '/');
+        $this->reset();
+    }
+
+    /**
      * True when the request reached the app over HTTPS.
      *
      * X-Forwarded-Proto is only honoured when [server] trust_proxy is enabled, so a
@@ -624,20 +634,24 @@ class App extends MagicObject {
 }
 
 /**
+ * App root: the directory that owns monad.ini, views, the database, cache and
+ * migrations. It defaults to the directory of the real entry script, so
+ * requiring this file from ../blog boots with ../blog as the app, not the
+ * framework checkout. The `monad` CLI overrides it with the working directory.
+ */
+$entryScript = get_included_files()[0] ?? __FILE__;
+$root = dirname(realpath($entryScript) ?: __FILE__);
+
+/**
  * Composer Integration & Minimalist Autoloader.
  */
-if (file_exists(__DIR__ . '/vendor/autoload.php')) {
-    require __DIR__ . '/vendor/autoload.php';
+foreach ([$root . '/vendor/autoload.php', __DIR__ . '/vendor/autoload.php'] as $composerAutoload) {
+    if (file_exists($composerAutoload)) require_once $composerAutoload;
 }
-
-spl_autoload_register(function ($class) {
-    $path = str_replace('\\', '/', $class);
-    $file = __DIR__ . "/{$path}.php";
-    if (file_exists($file)) require $file;
-});
 
 // --- APP INITIALIZATION ---
 $app = new App([
+    'root' => $root,
     'routes' => [],
     'globalMiddleware' => [],
     'registry' => [],
@@ -801,6 +815,7 @@ EOT;
         $this->props['commands'][$name] = $handler;
     },
     'dispatch' => function ($app) {
+        $app->handleErrors();
         if (php_sapi_name() === 'cli' && !isset($_SERVER['REQUEST_METHOD'])) {
             $argv = $_SERVER['argv'] ?? $GLOBALS['argv'] ?? [];
             $cmdName = $argv[1] ?? 'help';
@@ -999,20 +1014,46 @@ EOT;
     }
 ]);
 
-// --- GLOBAL ERROR HANDLERS ---
-set_error_handler(function ($severity, $message, $file, $line) {
-    if (!(error_reporting() & $severity)) return false;
-    // Deprecations are informative, not fatal: promoting them turned every PHP
-    // version bump into a wall of 500s. They are logged instead.
-    if ($severity & (E_DEPRECATED | E_USER_DEPRECATED)) {
-        error_log("[MONAD] Deprecated: $message in $file:$line");
-        return true;
-    }
-    throw new ErrorException($message, 0, $severity, $file, $line);
+// Engine classes live next to this file; every other namespace is app code under $app->root.
+spl_autoload_register(function ($class) use ($app) {
+    $path = str_replace('\\', '/', $class);
+    $base = str_starts_with($class, 'Monad\\') ? __DIR__ : $app->root;
+    $file = $base . "/{$path}.php";
+    if (file_exists($file)) require $file;
 });
 
-set_exception_handler(function (Throwable $e) use ($app) {
-    $app->renderError($e);
+// --- GLOBAL ERROR HANDLERS ---
+// Installed by dispatch(), not at include time: requiring the engine from a cron
+// script or another app must not hijack that process's error handling.
+$app->bind('handleErrors', function ($app) {
+    if (!empty($app->props()['_handlersInstalled'])) return;
+    $app->_handlersInstalled = true;
+
+    set_error_handler(function ($severity, $message, $file, $line) {
+        if (!(error_reporting() & $severity)) return false;
+        // Deprecations are informative, not fatal: promoting them turned every PHP
+        // version bump into a wall of 500s. They are logged instead.
+        if ($severity & (E_DEPRECATED | E_USER_DEPRECATED)) {
+            error_log("[MONAD] Deprecated: $message in $file:$line");
+            return true;
+        }
+        throw new ErrorException($message, 0, $severity, $file, $line);
+    });
+
+    set_exception_handler(function (Throwable $e) use ($app) {
+        $app->renderError($e);
+    });
+
+    // Catch fatal runtime errors (like E_ERROR or E_PARSE) that bypass standard try/catch blocks.
+    register_shutdown_function(function () use ($app) {
+        if (!empty($app->props()['_errorRendered'])) return; // already reported by the exception handler
+        $error = error_get_last();
+        if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+            $app->renderError(new \ErrorException(
+                $error['message'], 0, $error['type'], $error['file'], $error['line']
+            ));
+        }
+    });
 });
 
 /**
@@ -1043,8 +1084,8 @@ function route_pattern(string $path): string
 }
 
 // --- CORE SERVICES ---
-$app->bind('config', function() {
-    $file = __DIR__ . '/monad.ini';
+$app->bind('config', function($app) {
+    $file = $app->root . '/monad.ini';
     // INI_SCANNER_TYPED: without it `debug = false` arrived as the string "" and
     // every numeric setting as a string.
     $data = file_exists($file) ? (parse_ini_file($file, true, INI_SCANNER_TYPED) ?: []) : [];
@@ -1055,8 +1096,9 @@ $app->bind('config', function() {
 });
 
 $app->bind('db', function($app) {
-    $path = $app->config->db['path'] ?? 'db.sqlite';
-    $dsn = ($path === ':memory:') ? 'sqlite::memory:' : 'sqlite:' . __DIR__ . '/' . $path;
+    $path = (string) ($app->config->db['path'] ?? 'db.sqlite');
+    if ($path !== ':memory:' && !str_starts_with($path, '/')) $path = $app->root . '/' . $path;
+    $dsn = ($path === ':memory:') ? 'sqlite::memory:' : 'sqlite:' . $path;
     $pdo = new PDO($dsn);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
@@ -1116,7 +1158,7 @@ $app->bind('db', function($app) {
  */
 $app->bind('migrator', function ($app) {
     $dir = (string) ($app->config->migrations['path'] ?? 'migrations');
-    if (!str_starts_with($dir, '/')) $dir = __DIR__ . '/' . $dir;
+    if (!str_starts_with($dir, '/')) $dir = $app->root . '/' . $dir;
     $dir = rtrim($dir, '/');
 
     $app->db->execute('CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, batch INTEGER NOT NULL, ran_at TEXT NOT NULL)');
@@ -1321,7 +1363,7 @@ $app->bind('csrf', function($app) {
  */
 $app->bind('cache', function ($app) {
     $dir = (string) ($app->config->cache['path'] ?? sys_get_temp_dir() . '/monad-cache');
-    if (!str_starts_with($dir, '/')) $dir = __DIR__ . '/' . $dir;
+    if (!str_starts_with($dir, '/')) $dir = $app->root . '/' . $dir;
     $dir = rtrim($dir, '/');
     if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
         throw new \RuntimeException("Cannot create cache directory: $dir");
@@ -1438,11 +1480,11 @@ $app->bind('response', function($app) {
         ));
     };
 
-    // Views default to the project root for backwards compatibility, but should be moved
-    // outside the docroot (config: [views] path = "..."), otherwise templates are
-    // directly requestable over HTTP.
-    $viewRoot = (string) ($app->config->views['path'] ?? __DIR__);
-    if (!str_starts_with($viewRoot, '/')) $viewRoot = __DIR__ . '/' . $viewRoot;
+    // Views default to the app root, so `html.pages.home` resolves to
+    // <root>/html/pages/home.php. Move them outside the docroot with
+    // [views] path = "..." if they should not be directly requestable over HTTP.
+    $viewRoot = (string) ($app->config->views['path'] ?? $app->root);
+    if (!str_starts_with($viewRoot, '/')) $viewRoot = $app->root . '/' . $viewRoot;
     $viewRoot = rtrim($viewRoot, '/');
 
     $resolveTemplate = function ($name) use ($viewRoot) {
@@ -1616,23 +1658,10 @@ $app->bind('log', function ($app, $next) {
     $app->logger("{$app->response->statusCode} ({$ms}ms)");
 });
 
-// Catch fatal runtime errors (like E_ERROR or E_PARSE) that bypass standard try/catch blocks,
-// and route them safely through the application's central error handling system.
-register_shutdown_function(function() use ($app) {
-    if (!empty($app->props()['_errorRendered'])) return; // already reported by the exception handler
-    $error = error_get_last();
-    if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
-        $app->renderError(new \ErrorException(
-            $error['message'], 0, $error['type'], $error['file'], $error['line']
-        ));
-    }
-});
-
 // Auto-dispatch only when this file *is* the entry point. SCRIPT_FILENAME is not a
 // reliable signal: php -S resolves "/" to the directory index (index.php) even when the
 // entry script is something else, which caused a second, silent dispatch when embedding.
 // get_included_files()[0] is always the real entry script, on every SAPI.
-$entryScript = get_included_files()[0] ?? '';
 if (realpath($entryScript) === __FILE__) {
     $app->dispatch();
 }

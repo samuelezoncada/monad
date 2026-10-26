@@ -291,7 +291,7 @@ $test->it("CSRF: rejects wrong and missing tokens", function($app, $test) {
 });
 
 $test->it("CSRF: rejects an empty token when no token exists", function($app, $test) {
-    // hash_equals('', '') used to make the first POST in a session CSRF-exempt.
+    // An empty stored token must never match an empty submitted token.
     $test->expect($app->csrf->verify('', 'never-issued'))->toBeFalse();
 });
 
@@ -379,7 +379,7 @@ $test->it("Router: resolves middleware registered by name", function($app, $test
 });
 
 $test->it("Router: an unbound named middleware reports itself clearly", function($app, $test) {
-    // this used to fall through to PHP: "Call to undefined function auth()"
+    // An unbound name must fail loudly, not fall through to a global function.
     $app->addRoute('GET', '/guarded', fn($app) => $app->response->text('ok'), ['doesNotExist']);
     $res = $test->request('GET', '/guarded');
     $test->expect($res->statusCode)->toEqual(500);
@@ -574,7 +574,7 @@ $test->it("View: zero, false and null stay native", function($app, $test) {
     $view = new ViewContext(['zero' => 0, 'flag' => false, 'none' => null]);
 
     $test->expect($view->zero)->toEqual(0);
-    $test->expect($view->zero > 0)->toBeFalse();   // comparing a MagicValue to int used to throw
+    $test->expect($view->zero > 0)->toBeFalse();   // numbers stay native, so comparison works
     $test->expect($view->flag)->toBeFalse();
     $test->expect($view->none)->toEqual(null);
     $test->expect(empty($view->zero))->toBeTrue();
@@ -584,7 +584,7 @@ $test->it("View: arrays JSON-encode and report emptiness", function($app, $test)
     $view = new ViewContext(['items' => [1, 2], 'none' => []]);
 
     $test->expect(json_encode($view->items))->toEqual('[1,2]');
-    $test->expect(json_encode($view->none))->toEqual('[]');   // used to be {}
+    $test->expect(json_encode($view->none))->toEqual('[]');   // ViewContext serializes via JsonSerializable
     $test->expect($view->none->isEmpty())->toBeTrue();
     $test->expect($view->items->isEmpty())->toBeFalse();
 });
@@ -623,7 +623,7 @@ $test->it("View: an escaped value encodes to its raw form in JSON", function($ap
 });
 
 $test->it("View: values read through service objects are escaped too", function($app, $test) {
-    // $view->session->get('x') used to be handed over completely unescaped
+    // Strings read through a service object must still be escaped.
     $service = new MagicObject(['get' => fn($_, $k) => '<script>bad</script>']);
     $view = new ViewContext(['session' => $service]);
     $test->expect((string) $view->session->get('username'))->toEqual('&lt;script&gt;bad&lt;/script&gt;');
@@ -731,7 +731,7 @@ $test->it("View: a helper calling a sibling method is not corrupted by escaping"
         $app->addRoute('GET', '/head', fn($app) => $app->response->render('head'));
         preg_match('/hx-headers=\'(.*)\'>/', $test->request('GET', '/head')->body, $m);
         $decoded = json_decode(html_entity_decode($m[1] ?? '', ENT_QUOTES), true);
-        // the token used to serialise as {} because it arrived wrapped in a MagicValue
+        // The token must be a string, not a serialized MagicValue.
         $test->expect(is_string($decoded['X-CSRF-Token'] ?? null))->toBeTrue();
         $test->expect($app->csrf->verify($decoded['X-CSRF-Token']))->toBeTrue();
     });
@@ -1082,7 +1082,7 @@ $test->it("Logger: logger() actually writes a log line", function($app, $test) {
 });
 
 $test->it("Logger: logger() survives being read as a property first", function($app, $test) {
-    $fn = $app->logger;   // this used to poison the next call
+    $fn = $app->logger;   // reading the property must not replace the closure
     $test->expect(is_callable($fn))->toBeTrue();
     $log = tempnam(sys_get_temp_dir(), 'monadlog');
     $previous = ini_get('error_log');

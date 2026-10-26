@@ -110,6 +110,7 @@ interface CSRF {
  */
 interface Request {
     public function body(): string;
+    public function getQueryVar(string $name): mixed;
     public function getPostVar(string $name): mixed;
     public function getHeader(string $name): mixed;
 }
@@ -197,8 +198,8 @@ class MagicObject {
             return $this->props[$name];
         }
         if (isset($this->props['registry'][$name])) return $this->props['registry'][$name];
-        // Fail loudly: a typo used to resolve to null and blow up somewhere else entirely.
-        // Note that `$obj->maybe ?? $default` still works, because PHP consults __isset() first.
+        // Fail loudly: an unknown name is a typo, not null.
+        // (`$obj->maybe ?? $default` still works: PHP consults __isset() first.)
         throw new ServiceNotFoundException(static::class . ": undefined property or service '{$name}'");
     }
 
@@ -245,12 +246,9 @@ class ViewContext extends MagicObject implements View, \JsonSerializable {
     protected function wrap(mixed $v): mixed {
         if ($v instanceof MagicValue || $v instanceof RawHtml || $v instanceof ViewContext) return $v;
         if (is_array($v)) return new ViewContext($v);
-        // Service objects ($session, $request, $auth) were previously handed over raw,
-        // which silently bypassed escaping for anything read through them.
+        // Proxy services so values read through them are escaped too.
         if ($v instanceof MagicObject) return new ViewProxy($v);
-        // Only strings can carry markup. Wrapping ints/floats/bools/null made `>`
-        // throw, `empty()` always false and every value truthy, while escaping them
-        // was a no-op anyway.
+        // Only strings can carry markup; wrapping other scalars breaks >, empty() and truthiness.
         return is_string($v) ? new MagicValue($v) : $v;
     }
 
@@ -426,8 +424,7 @@ class TestSuite {
         unset($this->app->request);
         unset($this->app->response);
 
-        // Only header emission needs stubbing now: redirect()/json()/text() all funnel
-        // through setHeader(), so the code under test is the real code path.
+        // Stub header emission only; redirect()/json()/text() still run the real path.
         $headers = [];
         $this->app->response->setHeader = function($res, $n, $v) use (&$headers) {
             $headers[$n] = $v;
@@ -555,10 +552,10 @@ class TestSuite {
  *
  * @method void share(string $name, callable $factory)
  * @method void dump(mixed ...$vars)
- * @method void dd(mixed ...$vars)
  * @method string dumpHtml(mixed ...$vars)
  * @method void logger(string $msg)
  * @method bool wantsJson()
+ * @method void handleErrors()
  * @method void dispatch()
  * @method void renderError(Throwable $e)
  * @method void bind(string $name, mixed $value)
@@ -616,16 +613,13 @@ class App extends MagicObject {
 
         $server = $this->config->server ?? [];
         $raw = is_array($server) ? ($server['trust_proxy'] ?? false) : false;
-        // Typed ini values arrive as bools, but a quoted "false" arrives as a
-        // string and `(bool) "false"` is true — that would enable proxy trust.
+        // A quoted "false" is a string and `(bool) "false"` is true, which would enable proxy trust.
         $trustProxy = is_bool($raw) ? $raw : filter_var($raw, FILTER_VALIDATE_BOOLEAN);
         if (!$trustProxy) {
             return false;
         }
 
-        // Trust the last entry: it is the one added by the proxy nearest to us.
-        // A client-supplied value only ends up first if a proxy appends rather
-        // than overwrites, so the leftmost value is the wrong one to believe.
+        // Trust the last hop; a client-supplied first value is untrustworthy when proxies append.
         $parts = explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
         $proto = strtolower(trim((string) end($parts)));
 
@@ -761,9 +755,8 @@ EOT;
         }
         echo $app->dumpHtml(...$vars);
     },
-    // The logger follows the same convention as every other MagicObject closure
-    // (first argument is the owner). It reads $_SERVER directly rather than the
-    // request service, so it stays usable while that very service is failing.
+    // Convention: the first argument is the owner, like every other MagicObject closure.
+    // Reads $_SERVER directly so it works while the request service is failing.
     'logger' => function ($app, string $msg): void {
         $method = $_SERVER['REQUEST_METHOD'] ?? 'CLI';
         $path = $_SERVER['REQUEST_URI'] ?? ($_SERVER['argv'][1] ?? '-');
@@ -850,14 +843,12 @@ EOT;
         
         $resolver = function ($mw) {
             if (!is_string($mw)) return $mw;
-            // Unbound names used to fall through to PHP, which then looked for a *global
-            // function* of that name: "Call to undefined function auth()".
+            // A bound name is required: otherwise PHP would look for a global function.
             if (!isset($this->registry[$mw])) {
                 throw new \RuntimeException("Middleware '$mw' is not bound. Register it with \$app->bind('$mw', fn(\$app, \$next) => ...).");
             }
             $resolved = $this->registry[$mw];
-            // Services and middleware share one registry, so a service factory used as
-            // middleware would silently swallow $next and abort the chain. Catch it early.
+            // A service factory used as middleware would swallow $next; reject it early.
             if ($resolved instanceof \Closure) {
                 $ref = new \ReflectionFunction($resolved);
                 if ($ref->getNumberOfParameters() < 2 && !$ref->isVariadic()) {
@@ -871,9 +862,7 @@ EOT;
             $pipeline = array_map($resolver, array_merge($this->globalMiddleware, $matched['middleware']));
             $handler = $matched['handler'];
 
-            // The middleware pipeline is resolved as an "Onion" chain:
-            // We wrap the final route handler and traverse the middleware array in reverse order,
-            // so that the first middleware in the pipeline is executed first.
+            // Onion pipeline: wrap the handler, then apply middleware in reverse order.
             $chain = function ($app) use ($handler) {
                 if (is_array($handler)) {
                     $controller = new $handler[0]();
@@ -893,8 +882,7 @@ EOT;
         }
     },
     'renderError' => function ($app, Throwable $e) {
-        // Reentrancy guard: without it, an error raised *while* reporting an error
-        // (a stray warning, a failing service) replaced the original one and killed the process.
+        // Reentrancy guard: an error raised while reporting an error must not replace the original.
         if (!empty($this->props['_renderingError'])) {
             error_log('[MONAD] error while reporting an error: ' . $e->getMessage());
             return;
@@ -912,9 +900,8 @@ EOT;
         }
 
         try {
-            // Console commands get a plain STDERR report instead of an HTML page.
-            // The condition matches dispatch(): an in-process simulated HTTP request
-            // (the test suite) sets REQUEST_METHOD and must still get a real response.
+            // CLI gets plain STDERR. Matching dispatch() keeps simulated HTTP requests
+            // (REQUEST_METHOD set) on the real response path.
             if (PHP_SAPI === 'cli' && !isset($_SERVER['REQUEST_METHOD'])) {
                 fwrite(STDERR, sprintf(
                     "\n\033[31m%s\033[0m: %s\n  at %s:%d\n",
@@ -939,8 +926,7 @@ EOT;
             }
 
             if (!$debug) {
-                // Previously this returned nothing at all: a blank page instead of the
-                // "generic 500" the documentation promises.
+                // A production error must still render a page, not a blank 500.
                 echo "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>500 Server Error</title></head>"
                    . "<body style=\"font-family:system-ui,sans-serif;text-align:center;padding:4rem\">"
                    . "<h1>500</h1><p>Something went wrong on our end.</p></body></html>";
@@ -1007,16 +993,15 @@ spl_autoload_register(function ($class) use ($app) {
 });
 
 // --- GLOBAL ERROR HANDLERS ---
-// Installed by dispatch(), not at include time: requiring the engine from a cron
-// script or another app must not hijack that process's error handling.
+// Installed by dispatch(), not on include: requiring the engine must not hijack the
+// host process's error handling.
 $app->bind('handleErrors', function ($app) {
     if (!empty($app->props()['_handlersInstalled'])) return;
     $app->_handlersInstalled = true;
 
     set_error_handler(function ($severity, $message, $file, $line) {
         if (!(error_reporting() & $severity)) return false;
-        // Deprecations are informative, not fatal: promoting them turned every PHP
-        // version bump into a wall of 500s. They are logged instead.
+        // Deprecations are logged, not thrown: promoting them made every PHP upgrade a 500.
         if ($severity & (E_DEPRECATED | E_USER_DEPRECATED)) {
             error_log("[MONAD] Deprecated: $message in $file:$line");
             return true;
@@ -1354,16 +1339,14 @@ $app->bind('cache', function ($app) {
     }
     $miss = new \stdClass();   // sentinel: distinguishes "absent" from a cached null
 
-    // The read path never instantiates classes, so an object written here could
-    // only ever come back as a miss (and `remember()` would recompute forever).
-    // Reject it at the boundary instead of failing silently later.
+    // The read path cannot reconstruct objects, so reject them here instead of
+    // writing an entry that would always miss (and make remember() recompute forever).
     $containsObject = function ($v) use (&$containsObject): bool {
         if (is_object($v)) return true;
         if (is_array($v)) foreach ($v as $item) if ($containsObject($item)) return true;
         return false;
     };
-    // Objects nested inside an array also deserialize into __PHP_Incomplete_Class,
-    // so the check has to be recursive for the "object entry is a miss" promise to hold.
+    // Nested objects also become __PHP_Incomplete_Class on read; check recursively.
     $containsIncomplete = function ($v) use (&$containsIncomplete): bool {
         if ($v instanceof \__PHP_Incomplete_Class) return true;
         if (is_array($v)) foreach ($v as $item) if ($containsIncomplete($item)) return true;
@@ -1378,8 +1361,7 @@ $app->bind('cache', function ($app) {
             if (!is_file($file)) return $default;
             $raw = @file_get_contents($file);
             if ($raw === false) return $default;
-            // Never instantiate classes from a cache file: a local attacker who
-            // can write here must not be able to trigger __wakeup/__destruct.
+            // Never instantiate classes from a cache file: a writable cache would be a __wakeup payload.
             $entry = @unserialize($raw, ['allowed_classes' => false]);
             if (!is_array($entry) || !array_key_exists('expires', $entry)) return $default;
             if ($containsIncomplete($entry['value'] ?? null)) {
@@ -1442,14 +1424,12 @@ $app->bind('request', function($app) {
 
 $app->bind('response', function($app) {
     $compileViewContext = function ($res, array $data) {
-        // Globals registered with $app->share() are resolved lazily through the
-        // registry, so declaring one costs nothing until a template touches it.
+        // Shared globals resolve on first access, so declaring one costs nothing.
         $lazyGlobals = [];
         foreach (($res->app->props()['shared'] ?? []) as $name => $factory) {
             $lazyGlobals[$name] = fn () => $factory($res->app);
         }
-        // Keep the session lazy as well: rendering a public page must not start
-        // an anonymous session just because a template may look at flash data.
+        // Keep the session lazy too: rendering a public page must not start an anonymous session.
         $lazyGlobals['session'] = fn () => $res->app->session;
         return new ViewContext(array_merge(
             ['data' => $data],
@@ -1464,9 +1444,8 @@ $app->bind('response', function($app) {
         ));
     };
 
-    // Views default to the app root, so `html.pages.home` resolves to
-    // <root>/html/pages/home.php. Move them outside the docroot with
-    // [views] path = "..." if they should not be directly requestable over HTTP.
+    // Views default to the app root: html.pages.home -> <root>/html/pages/home.php.
+    // Move them outside the docroot with [views] path = "..." if they must not be requestable.
     $viewRoot = (string) ($app->config->views['path'] ?? $app->root);
     if (!str_starts_with($viewRoot, '/')) $viewRoot = $app->root . '/' . $viewRoot;
     $viewRoot = rtrim($viewRoot, '/');
@@ -1492,8 +1471,7 @@ $app->bind('response', function($app) {
         'headers' => [],
         'layout' => null,
         'htmx' => new MagicObject([]),
-        // Tracks whether a response body has already been produced, so a stray second
-        // render()/json()/redirect() cannot corrupt the output.
+        // Prevents a stray second render()/json()/redirect() from corrupting the output.
         'sent' => false,
         'oobFragments' => [],
         /**

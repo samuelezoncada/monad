@@ -2,8 +2,8 @@
 /**
  * Monad app entry point.
  *
- * The engine lives in monad.php: put routes, middleware
- * and app services here.
+ * The engine lives in monad.php. Put routes, middleware and app services here;
+ * this file is a launcher and should stay trivial.
  */
 $app = require __DIR__ . '/monad.php';
 

@@ -4,6 +4,16 @@ Notable changes to Monad. This project follows [Semantic Versioning](https://sem
 while the major version is 0, breaking changes may land in minor releases and are
 called out below.
 
+## [0.1.1] - 2026-10-26
+
+Packaging release; no runtime changes.
+
+### Changed
+
+- Package archives exclude `.github/`. Tests were already excluded via
+  `.gitattributes`, so the Composer dist now contains only engine, CLI, docs and
+  package metadata.
+
 ## [0.1.0] - 2026-10-26
 
 First tagged release.

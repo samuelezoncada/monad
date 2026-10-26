@@ -1061,8 +1061,10 @@ $test->it("Auth: honours a custom id column", function($app, $test) {
     ]);
 
     $test->expect($app->auth->attempt('ada@example.com', 'secret123'))->toBeTrue();
-    $test->expect($app->auth->id())->toEqual(1);
-    $test->expect($app->auth->user()['user_id'])->toEqual(1);
+    // PDO SQLite returned integer columns as strings before PHP 8.1; the column
+    // mapping is what this test is about, not the driver's scalar type.
+    $test->expect((int) $app->auth->id())->toEqual(1);
+    $test->expect((int) $app->auth->user()['user_id'])->toEqual(1);
 });
 
 $test->it("Auth: an invalid table name is rejected at configuration time", function($app, $test) {

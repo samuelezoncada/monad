@@ -4,6 +4,15 @@ Notable changes to Monad. This project follows [Semantic Versioning](https://sem
 while the major version is 0, breaking changes may land in minor releases and are
 called out below.
 
+## [0.1.2] - 2026-10-26
+
+Test-only release; no runtime changes.
+
+### Fixed
+
+- The auth id-column test normalises PDO SQLite integer ids, which are returned as
+  strings before PHP 8.1. CI is green on PHP 8.0 through 8.5 again.
+
 ## [0.1.1] - 2026-10-26
 
 Packaging release; no runtime changes.

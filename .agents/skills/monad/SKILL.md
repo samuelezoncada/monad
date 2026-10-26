@@ -19,6 +19,7 @@ Use me whenever you are writing or modifying code in a Monad project — adding 
 
 - **No `src/`, no Composer, no build step.** The engine is a single `monad.php` (~1600 lines); `index.php` is a small app entry point.
 - All framework classes live in the `Monad` namespace (`Monad\App`, `Monad\MagicObject`, `Monad\RawHtml`, ...). App code starts with `use Monad\App;`.
+- `$app->root` is the app directory: `monad.ini`, views, db, cache and migrations resolve from it. Defaults to the entry script's directory; `$app->setRoot()` overrides it. The `monad` CLI roots at the working directory.
 - `monad.php` returns `$app` when `require`d and never dispatches; the entry point calls `$app->dispatch()`. Global handlers are installed by `dispatch()` (or `$app->handleErrors()`), not on include.
 - CLI entry point: `#!/usr/bin/env php` wrapper that `require`s `monad.php`, sets the root to the working directory and calls `$app->dispatch()`.
 - Autoloader: `Monad\Foo\Bar` → `./Monad/Foo/Bar.php` next to the engine; every other namespace loads from the app root. `vendor/autoload.php` is looked up in the app root first.
@@ -89,25 +90,25 @@ $app->response->layout = 'html.main_layout';
 $app->response->render('html.pages.home', ['user' => [...]]);
 ```
 
-Inside a template, `$view` is a `ViewContext` with auto-escaping and fluent helpers:
+Inside a template, `$view` is a `ViewContext`: strings are auto-escaped, while numbers, booleans and `null` stay native PHP values.
 
 ```php
-<?= $view->data->user->name ?>              <!-- auto-escaped via MagicValue::__toString() -->
-<?= $view->data->user->balance->number(2) ?> <!-- number_format -->
-<?= $view->data->user->balance->raw() ?>     <!-- bypass escaping (rarely needed) -->
-<?= $view->config->debug ?>                  <!-- global config -->
-<?= $view->session->get('key') ?>           <!-- session access -->
-<?= $view->partial('sub.template', [...]) ?> <!-- renders a partial; returns RawHtml, not double-escaped -->
-<?= $view->dump($data) ?>                    <!-- escaped <pre> var_dump, trusted markup -->
+<?= $view->data->user->name ?>                     <!-- auto-escaped via MagicValue::__toString() -->
+<?= number_format($view->data->user->balance, 2) ?> <!-- native number, no wrapper -->
+<?= $view->data->user->name->raw() ?>               <!-- bypass escaping (rarely needed) -->
+<?= $view->config->debug ?>                         <!-- global config -->
+<?= $view->session->get('key') ?>                   <!-- session access -->
+<?= $view->partial('sub.template', [...]) ?>        <!-- renders a partial; returns RawHtml, not double-escaped -->
+<?= $view->dump($data) ?>                           <!-- escaped <pre> var_dump, trusted markup -->
 ```
 
-`$view->data` wraps every value in `MagicValue` (strings/numbers) or `ViewContext` (arrays), recursively. `foreach ($view->data->items as $item)` yields `ViewContext` objects — `$item->name` is still auto-escaped.
+`$view->data` wraps strings in `MagicValue` and arrays in `ViewContext`, recursively. Ints, floats, bools and `null` pass through untouched, so `number_format()`, `date()`, arithmetic, `empty()` and strict comparisons behave like plain PHP. `foreach ($view->data->items as $item)` yields `ViewContext` objects — `$item->name` is still auto-escaped.
 
 Escaping semantics to remember:
 
 - `MagicValue` implements `Stringable` **and** `JsonSerializable` (an escaped value still `json_encode`s to its raw form).
-- `->date()` returns `''` on unparseable input (no silent fallback to the epoch).
-- **Service objects** reached from a template (`$view->request`, `$view->session`, `$view->auth`) are wrapped in a `ViewProxy`: values read through them are escaped too, but booleans stay real booleans (`if ($view->request->htmx->is)`).
+- Arrays are `ViewContext`, so `json_encode()` gives the array, but `empty()` cannot describe an object: use `count()` or `->isEmpty()`.
+- **Service objects** reached from a template (`$view->request`, `$view->session`, `$view->auth`) are wrapped in a `ViewProxy`: values read through them are escaped too, but non-string scalars stay native.
 - **`RawHtml`** marks already-safe markup and is emitted verbatim. Returned by `partial`, `dump`, `csrf->field()`, `csrf->htmxAttribute()`.
 
 Layout slot pattern: `$slot` is available in layout templates. Template content is captured and passed as `$slot`.
@@ -147,7 +148,7 @@ Table and column names are validated against `/^[a-zA-Z0-9_]+$/` — invalid nam
 
 ## Sessions, Flash & CSRF
 
-Sessions are hardened by default (HttpOnly, SameSite=Lax, Secure behind HTTPS, strict id mode).
+Sessions are hardened by default (HttpOnly, SameSite=Lax, Secure behind HTTPS, strict id mode). Behind a TLS-terminating proxy, set `[server] trust_proxy = true` and send `X-Forwarded-Proto: https`; only enable it when the app is not directly reachable.
 
 ```php
 $app->session->set('theme', 'dark');
@@ -193,7 +194,7 @@ $app->addRoute('GET', '/dashboard', handler, ['requireAuth']);
 
 ## Caching
 
-Filesystem cache with atomic writes (temp + rename). TTL in seconds; `0` = never expires.
+Filesystem cache with atomic writes (temp + rename). TTL in seconds; `0` = never expires. Only scalars and arrays are cacheable: `set()`/`remember()` throw `InvalidArgumentException` for values containing objects, since the read path never instantiates classes.
 
 ```php
 $app->cache->set('key', $value, 3600);
@@ -218,7 +219,7 @@ return [
 ];
 ```
 
-Config: `[migrations] path = "migrations"`. Run with `./monad migrate` / `./monad migrate:rollback` / `./monad migrate:status` / `./monad migrate:make <name>`.
+Config: `[migrations] path = "migrations"`. Run with `./monad migrate` / `./monad migrate:rollback` / `./monad migrate:status`.
 
 ## Testing
 

@@ -190,7 +190,7 @@ $app->response->render('html.pages.home', [
 <?php endif; ?>
 ```
 
-Templates are resolved using **dot notation** relative to the project root. For example, `html.admin.dashboard` maps to `./html/admin/dashboard.php`. Template names are validated (no slashes, no `..`) so they can never escape the view root.
+Templates are resolved using **dot notation** relative to the app root. For example, `html.admin.dashboard` maps to `./html/admin/dashboard.php`. Template names are validated (no slashes, no `..`) so they can never escape the view root.
 
 ### Escaping semantics
 * Strings are wrapped in `MagicValue`, whose `__toString()` HTML-escapes automatically. Helpers on strings: `->default($fallback)`, `->json()`, `->raw()`.
@@ -474,7 +474,7 @@ $app->addRoute('GET', '/', fn ($app) => $app->response->render('html.home'));
 $app->dispatch();
 ```
 
-`monad.ini`, `html/`, `db.sqlite`, the cache directory and `migrations/` all resolve from `../blog`, not from the framework checkout. If the entry point is not the project root, call `$app->setRoot('/path/to/app')` before booting.
+`monad.ini`, `html/`, `db.sqlite`, the cache directory and `migrations/` all resolve from `../blog`, not from the framework checkout. If the entry point is not the app root, call `$app->setRoot('/path/to/app')` before booting.
 
 Global error and exception handlers are installed by `dispatch()`, not when the file is included. Requiring the engine from a cron script therefore does not take over the host process's error handling; call `$app->handleErrors()` if you want the error page without routing.
 
@@ -596,7 +596,7 @@ path = "migrations"
 path = "views"
 ```
 
-The `views` path is optional: templates default to the project root. Putting them outside the docroot (e.g. `path = "views"`) keeps them from being directly requestable over HTTP.
+The `views` path is optional: templates default to the app root. Putting them outside the docroot (e.g. `path = "views"`) keeps them from being directly requestable over HTTP.
 
 ---
 

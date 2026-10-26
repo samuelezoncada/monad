@@ -667,22 +667,6 @@ EOT;
                 echo "  - $cmd\n";
             }
         },
-        'routes' => function($app) {
-            $routes = $app->props()['routes'] ?? [];
-            if (empty($routes)) {
-                echo "  (No routes registered)\n";
-                return;
-            }
-            foreach ($routes as $method => $methodRoutes) {
-                foreach ($methodRoutes as $route) {
-                    $path = $route['path'] ?? $route['pattern'];
-                    $mw = implode(', ', array_map(fn($m) => is_string($m) ? $m : 'Closure', $route['middleware']));
-                    $h = $route['handler'];
-                    $cntrl = is_array($h) ? $h[0] . '::' . $h[1] : (is_string($h) ? $h : 'Closure');
-                    echo "  " . str_pad("[$method]", 8) . str_pad($path, 30) . " -> $cntrl" . ($mw ? "  ($mw)" : "") . "\n";
-                }   
-            }
-        },
         'migrate' => function ($app, $args = []) {
             $m = $app->migrator;
             $pending = $m->pending();

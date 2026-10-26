@@ -454,7 +454,6 @@ Built-in commands:
 | Command | Purpose |
 | --- | --- |
 | `./monad help` | List available commands |
-| `./monad routes` | List registered routes |
 | `./monad migrate` | Apply all pending migrations (one batch) |
 | `./monad migrate:rollback` | Undo the last batch |
 | `./monad migrate:status` | Show which migrations have run / are pending |

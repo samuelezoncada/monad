@@ -33,7 +33,6 @@ php -S localhost:8000 -t .        # dev server
 ./monad test tests.php            # single file
 ./monad test tests/               # recursive (*Test.php / *test.php)
 ./monad test --filter=csrf        # only tests matching the description
-./monad routes                    # list routes
 ./monad help                      # list commands
 ./monad migrate                   # apply pending migrations
 ./monad migrate:rollback          # undo last batch

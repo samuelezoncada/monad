@@ -986,12 +986,6 @@ $test->it("CLI: registers commands", function($app, $test) {
     $test->expect(isset($app->props()['commands']['test:cmd']))->toBeTrue();
 });
 
-$test->it("CLI: routes command lists registered routes", function($app, $test) {
-    $app->addRoute('GET', '/listed', 'handler');
-    ob_start(); $app->props()['commands']['routes']($app); $out = ob_get_clean();
-    $test->expect($out)->toContain('/listed');
-});
-
 // --- 13. REQUEST ---
 $test->it("Request: parses path correctly", function($app, $test) {
     $app->addRoute('GET', '/some/path', function($app) use ($test) {

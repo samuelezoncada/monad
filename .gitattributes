@@ -1,3 +1,4 @@
+/.github/       export-ignore
 /tests.php      export-ignore
 /tests/         export-ignore
 /AGENTS.md      export-ignore

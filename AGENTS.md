@@ -1,6 +1,7 @@
 # AGENTS.md
 
 - Monad is a single-file PHP micro-framework. `monad.php` is the entire engine; `index.php` is the app entry point. No `src/`, no build step, no Composer required.
+- The single-file rule is an architectural constraint: engine logic lives only in `monad.php`. `index.php` (12 lines) and the `monad` CLI (8 lines) are launchers — require, setRoot, dispatch — and must stay trivial. `tests.php` is the suite, not runtime code.
 - `monad.php` returns `$app` when required and never dispatches. `index.php` (or the `monad` CLI) calls `$app->dispatch()`.
 - PHP 8.0+, PDO extension. Dev server: `php -S localhost:8000 -t .`
 - `cp monad.example.ini monad.ini` on first clone — `monad.ini` is gitignored. Config is loaded into `$app->config` only (never exported to the environment).
